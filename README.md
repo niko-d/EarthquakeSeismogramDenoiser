@@ -19,6 +19,8 @@ Dahmen, N., Clinton, J., Meier, M.-A., & Scarabello, L. (2026).
 Towards Operational Earthquake Seismogram Denoising. 
 Bulletin of the Seismological Society of America.
 
+![EQS Denoiser Workflow](MethodFig_onelevel_label.png)
+
 ### Environment Setup Instructions (Ubuntu)
 
 Create and activate a virtual environment named `eqs` and install all dependencies listed in `requirements.txt`:
@@ -34,11 +36,14 @@ pip install -r requirements.txt
 Code examples:
 
 Single time window denoising:
-Notebook in [Open Notebook](Code/EQS-Denoiser_example.py) 
+Notebook in [Open Notebook](Images/EQS-Denoiser_example.py) 
 
 ====================================================================================================================
 
 Denoising and signal detection on continuous data:
+
+![EQS Denoiser Workflow](Images/continuous_data_label.png)
+
 
 Data download from "ETH" Client, preprocessing, signal detection and denoising for 600s following 2025-02-07T17:00:00. both raw and denoised data are saved.
 ```
