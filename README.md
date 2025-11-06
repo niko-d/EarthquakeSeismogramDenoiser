@@ -12,7 +12,7 @@ python3 -m venv eqs_test
 source eqs/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-
+```
 
 Code examples:
 
@@ -23,5 +23,6 @@ Denoising and signal detection on continuous data
 Terminal:
 
 Data download from "ETH" Client, preprocessing, signal detection and denoising for 600s following 2025-02-07T17:00:00. both raw and denoised data are saved
+```
 python ./DenoiseData_terminal_public.py CH MFERR ?? 2025-02-07T17:00:00 600 --saveraw True --model_name ../Models/model_1000k_onlyweights.keras --client_str ETH
-
+```
