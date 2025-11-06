@@ -13,7 +13,7 @@ Contact: nikolaj.dahmen@eaps.ethz.ch
 ====================================================================================================================
 
 
-For details on, see:
+For details, see:
 
 Dahmen, N., Clinton, J., Meier, M.-A., & Scarabello, L. (2026). 
 Towards Operational Earthquake Seismogram Denoising. 
@@ -40,7 +40,8 @@ Notebook in [Open Notebook](Images/EQS-Denoiser_example.py)
 
 ====================================================================================================================
 
-Denoising and signal detection on continuous data:
+###Denoising and signal detection on continuous data
+Uses overlapping windows and detection scores to select the best waveform from parallel/overlapping denoised solutions.
 
 ![EQS Denoiser Workflow](Images/continuous_data_label.png)
 
