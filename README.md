@@ -1,14 +1,17 @@
 
-==========================================================
+====================================================================================================================
+
 
 # Earthquake-Seismogram-Denoiser
 
-==========================================================
+====================================================================================================================
+
 
 Created by: Niko Dahmen, ETH Zurich
 Contact: nikolaj.dahmen@eaps.ethz.ch
 
-==========================================================
+====================================================================================================================
+
 
 For details on, see:
 
@@ -26,13 +29,16 @@ source eqs/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
+====================================================================================================================
 
 Code examples:
 
 Single time window denoising:
 Notebook in [Open Notebook](Code/EQS-Denoiser_example.py) 
 
-Denoising and signal detection on continuous data
+====================================================================================================================
+
+Denoising and signal detection on continuous data:
 
 Data download from "ETH" Client, preprocessing, signal detection and denoising for 600s following 2025-02-07T17:00:00. both raw and denoised data are saved.
 ```
@@ -53,17 +59,20 @@ Required arguments:
 
 Optional arguments:
   --threshold       (float) Detection score threshold to collect detections above this value (NOT RECOMMENDED TO CHANGE)
-                           Default: 1.0
+                           Default: 10.0
 
   --saveraw         (str)   Save preprocessed raw data if set to "True"
                            Default: "False"
 
   --model_name      (str)   Path to trained model file
-                           Default: "model_name"
+                           Default: "model_paper"
 
   --verbose         (flag)  Enable verbose output (no value needed)
 
   --min_peak_height (float) Minimum threshold (0-1) for peak detection sensitivity (SET TO 0.33 IN STUDY)
+                           Default: None
+
+  --client_str      (str)   Client string, e.g., 'ETH'
                            Default: None
 
 ```
