@@ -1,9 +1,7 @@
 # Earthquake-Seismogram-Denoiser
 
 
-## EQS Test Environment Setup
-
-## Setup Instructions (Ubuntu)
+### Environment Setup Instructions (Ubuntu)
 
 Create and activate a virtual environment named `eqs` and install all dependencies listed in `requirements.txt`:
 
