@@ -21,16 +21,26 @@ Bulletin of the Seismological Society of America.
 
 ![EQS Denoiser Workflow](Images/MethodFig_onelevel_label.png)
 
-### Environment Setup Instructions (Ubuntu)
+### Environment Setup Instructions
 
 Create and activate a virtual environment named `eqs` and install all dependencies listed in `requirements.txt`:
 
+Linux: 
 ```bash
 python3 -m venv eqs
 source eqs/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+Windows:
+```bash
+python -m venv eqs
+eqs\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
 ==============================================================================================================
 
 Code examples:
