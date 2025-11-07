@@ -87,7 +87,7 @@ Optional arguments:
   --min_peak_height (float) Minimum threshold (0-1) for peak detection sensitivity (SET TO 0.33 IN STUDY)
                            Default: None
 
-  --client_str      (str)   Client string, e.g., 'ETH'
-                           Default: None
+  --client_str      (str)   Client string, e.g., 'ETH', see https://docs.obspy.org/packages/obspy.clients.fdsn.html
+                           Default: ETH
 
 ```
