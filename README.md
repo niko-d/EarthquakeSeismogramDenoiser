@@ -94,7 +94,6 @@ Optional arguments:
 ```
 
 
-Using phase picker through SeisBench on denoised data with Test Time Augmentation in Picking_public.py:
+Using phase picker on denoised data with Test Time Augmentation in Picking_public.py:
 
-<img src="Images/TTA_figure_paper_simple2" alt="TTA Picking" width="500">
-
+![Phase Picking with Test Time Augmentation](Images/TTA_figure_paper_simple2.png)
