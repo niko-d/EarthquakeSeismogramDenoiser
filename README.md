@@ -47,7 +47,7 @@ pip install -r requirements.txt
 Code examples:
 
 Single time window denoising:
-Notebook in [Open Notebook](EarthquakeSeismogramDenoiser/Code/EQS-Denoiser_example.py) 
+Notebook in [Open Example Script](Code/EQS-Denoiser_example.py) 
 
 ================================================================================
 
@@ -95,6 +95,6 @@ Optional arguments:
 ================================================================================
 
 
-### Using phase picker on denoised data with Test Time Augmentation in Picking_public.py:
+### Using phase picker on denoised data with Test Time Augmentation (Picking_public.py):
 
 ![Phase Picking with Test Time Augmentation](Images/TTA_figure_paper_simple2.png)
