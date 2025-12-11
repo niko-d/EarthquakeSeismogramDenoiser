@@ -52,7 +52,7 @@ Notebook in [Open Notebook](EarthquakeSeismogramDenoiser/Code/EQS-Denoiser_examp
 ==============================================================================================================
 
 ### Denoising and signal detection on continuous data
-Uses overlapping windows and detection scores to select the best waveform from parallel/overlapping denoised solutions.
+Uses overlapping windows and detection scores to select the best waveform from parallel/overlapping denoised solutions (DenoiseData_terminal_public.py).
 
 <img src="Images/continuous_data_label.png" alt="EQS Denoiser Workflow" width="500">
 
@@ -94,6 +94,6 @@ Optional arguments:
 ```
 
 
-Using phase picker on denoised data with Test Time Augmentation in Picking_public.py:
+### Using phase picker on denoised data with Test Time Augmentation in Picking_public.py:
 
 ![Phase Picking with Test Time Augmentation](Images/TTA_figure_paper_simple2.png)
