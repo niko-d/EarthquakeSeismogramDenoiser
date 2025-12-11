@@ -25,7 +25,7 @@ from DenoisingFunctions_public import get_data, wv2stft, plot_stft, plot_masks, 
 model = tf.keras.models.load_model("/Material/Models/model_1000k_onlyweights.keras", compile=False)
 
 # ADJUST PATHS IF DIFFERENT
-module_dir = "/home/niko/Schreibtisch/EQ_denoising/Submission/Material/Code/"
+module_dir = "/Material/Code/"
 sys.path.append(module_dir)
 
 
