@@ -92,3 +92,9 @@ Optional arguments:
                            Default: ETH
 
 ```
+
+
+Using phase picker through SeisBench on denoised data with Test Time Augmentation in Picking_public.py:
+
+<img src="Images/TTA_figure_paper_simple2" alt="TTA Picking" width="500">
+
