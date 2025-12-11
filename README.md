@@ -47,7 +47,7 @@ pip install -r requirements.txt
 Code examples:
 
 Single time window denoising:
-Notebook in [Open Notebook](Images/EQS-Denoiser_example.py) 
+Notebook in [Open Notebook](EarthquakeSeismogramDenoiser/Code/EQS-Denoiser_example.py) 
 
 ==============================================================================================================
 
