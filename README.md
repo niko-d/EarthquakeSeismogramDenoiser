@@ -20,7 +20,7 @@ Dahmen, N., Clinton, J., Meier, M.-A., & Scarabello, L. (2026).
 Towards Operational Earthquake Seismogram Denoising. 
 Bulletin of the Seismological Society of America.
 
-![EQS Denoiser Workflow](Images/MethodFig_onelevel_label.png)
+![EQS Denoiser Workflow](Images/MethodFig_onelevel_simple.png)
 
 ### Environment Setup Instructions
 
