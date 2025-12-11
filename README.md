@@ -1,17 +1,17 @@
 
-==============================================================================================================
+================================================================================
 
 
 # Earthquake-Seismogram-Denoiser
 
-==============================================================================================================
+================================================================================
 
 
 Created by: Niko Dahmen
 ETH Zurich
 Contact: nikolaj.dahmen@eaps.ethz.ch
 
-==============================================================================================================
+================================================================================
 
 
 For details, see:
@@ -42,14 +42,14 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-==============================================================================================================
+================================================================================
 
 Code examples:
 
 Single time window denoising:
 Notebook in [Open Notebook](EarthquakeSeismogramDenoiser/Code/EQS-Denoiser_example.py) 
 
-==============================================================================================================
+================================================================================
 
 ### Denoising and signal detection on continuous data
 Uses overlapping windows and detection scores to select the best waveform from parallel/overlapping denoised solutions (DenoiseData_terminal_public.py).
@@ -92,6 +92,7 @@ Optional arguments:
                            Default: ETH
 
 ```
+================================================================================
 
 
 ### Using phase picker on denoised data with Test Time Augmentation in Picking_public.py:
