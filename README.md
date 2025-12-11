@@ -47,7 +47,7 @@ pip install -r requirements.txt
 Code examples:
 
 Single time window denoising:
-Notebook in [Open Notebook](Code/EQS-Denoiser_example.py) 
+Notebook in [EQS-Denoiser_example.py](Code/EQS-Denoiser_example.py) 
 
 ================================================================================
 
