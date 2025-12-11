@@ -56,7 +56,7 @@ Uses overlapping windows and detection scores to select the best waveform from p
 
 <img src="Images/continuous_data_label.png" alt="EQS Denoiser Workflow" width="500">
 
-Data download from "ETH" Client, preprocessing, signal detection and denoising for 600s following 2025-02-07T17:00:00. both raw and denoised data are saved.
+Example: Data download from "ETH" Client, preprocessing, signal detection and denoising for 600s following 2025-02-07T17:00:00. both raw and denoised data are saved.
 ```
 python ./DenoiseData_terminal_public.py CH MFERR ?? 2025-02-07T17:00:00 600 --saveraw True --model_name ../Models/model_1000k_onlyweights.keras --client_str ETH
 ```
