@@ -56,6 +56,7 @@ Notebook in [EQS-Denoiser_example.py](Code/EQS-Denoiser_example.py)
 Uses overlapping windows and detection scores to select the best waveform from parallel/overlapping denoised solutions (DenoiseData_terminal_public.py).
 
 <img src="Images/continuous_data_label.png" alt="EQS Denoiser Workflow" width="500">
+***Continuous Data Denoising.** Dahmen et al., BSSA*
 
 Example: Data download from "ETH" Client, preprocessing, signal detection and denoising for 600s following 2025-02-07T17:00:00. both raw and denoised data are saved.
 ```
@@ -99,3 +100,5 @@ Optional arguments:
 ### Using phase picker on denoised data with Test Time Augmentation (Picking_public.py):
 
 ![Phase Picking with Test Time Augmentation](Images/TTA_figure_paper_simple2.png)
+***Phase Picking with Test Time Augmentation.** Dahmen et al., BSSA*
+
