@@ -16,7 +16,7 @@ Contact: nikolaj.dahmen@eaps.ethz.ch
 
 For details, see:
 
-Dahmen, N., Clinton, J., Meier, M.-A., & Scarabello, L. (2026). 
+Dahmen, N., Clinton, J., Meier, M.-A., & Scarabello, L.. 
 Towards Operational Earthquake Seismogram Denoising. 
 Bulletin of the Seismological Society of America.
 
