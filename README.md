@@ -1,5 +1,5 @@
 
-[![DOI](https://zenodo.org/badge/1091010030.svg)](https://doi.org/10.5281/zenodo.17935346)
+[![https://doi.org/10.5281/zenodo.17935346](https://zenodo.org/badge/1091010030.svg)](https://doi.org/10.5281/zenodo.17935346)
 
 ================================================================================
 
