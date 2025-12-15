@@ -1,0 +1,40 @@
+cff-version: 1.2.0
+title: "Earthquake-Seismogram-Denoiser"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: Dahmen
+    given-names: Nikolaj
+    affiliation: ETH Zurich
+    email: nikolaj.dahmen@eaps.ethz.ch
+    orcid: https://orcid.org/0000-0002-9114-6747
+  - family-names: Clinton
+    given-names: John
+  - family-names: Meier
+    given-names: Men-Andrin
+  - family-names: Scarabello
+    given-names: Luca
+repository-code: https://github.com/niko-d/EarthquakeSeismogramDenoiser
+abstract: >
+  Earthquake-Seismogram-Denoiser (EQS-Denoiser) for signal detection and denoising on continuous data
+keywords:
+  - seismology
+  - earthquake
+  - waveform denoising
+  - deep learning
+  - seismic monitoring
+license: MIT
+references:
+  - type: article
+    authors:
+      - family-names: Dahmen
+        given-names: Nikolaj
+      - family-names: Clinton
+        given-names: John
+      - family-names: Meier
+        given-names: Men-Andrin
+      - family-names: Scarabello
+        given-names: Luca
+    title: "Towards Operational Earthquake Seismogram Denoising"
+    journal: "Bulletin of the Seismological Society of America"
+
