@@ -21,6 +21,7 @@ Towards Operational Earthquake Seismogram Denoising.
 Bulletin of the Seismological Society of America.
 
 ![EQS Denoiser Workflow](Images/MethodFig_onelevel_simple.png)
+***EQS-Denoiser workflow.** Dahmen et al., BSSA*
 
 ### Environment Setup Instructions
 
