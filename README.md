@@ -55,7 +55,7 @@ Notebook in [EQS-Denoiser_example.py](Code/EQS-Denoiser_example.py)
 ### Denoising and signal detection on continuous data
 Uses overlapping windows and detection scores to select the best waveform from parallel/overlapping denoised solutions (DenoiseData_terminal_public.py).
 
-<img src="Images/continuous_data_label.png" alt="EQS Denoiser Workflow" width="500">
+![Continuous Data Denoising](Images/continuous_data_label.png)
 ***Continuous Data Denoising.** Dahmen et al., BSSA*
 
 Example: Data download from "ETH" Client, preprocessing, signal detection and denoising for 600s following 2025-02-07T17:00:00. both raw and denoised data are saved.
