@@ -16,6 +16,10 @@ from obspy import UTCDateTime
 import obspy
 import scipy
 from pathlib import Path
+import math
+import warnings
+
+#import tracemalloc
 
 import numpy as np
 from scipy.signal import find_peaks
@@ -219,11 +223,13 @@ def process_segment(i):
         print(f"Computing STFT segment: {i}")
     stft_tmp, stft_tmp_norm = np.zeros((64, 256, 6)), np.zeros((64, 256, 6))
 
+    # RR: Can probably be rewritten more numpy-ic
     for j, data in enumerate([data_z, data_n, data_e]):
         snippet_tmp = data[i * shift_samples:i * shift_samples + len_sample]
         if len(snippet_tmp) != len_sample:
             if set_verbose:
                 print(f"Skipped segment {i} due to insufficient data length")
+                print(f"len_sample: {len_sample}, effective length: {len(snippet_tmp)}")
             return None  # Returning None if skipped
 
         f, t, _stft = scipy.signal.stft(snippet_tmp, **stft_parameters)
@@ -341,6 +347,7 @@ def process_seismic_data(network, station, channel, start_time, duration, verbos
         print(wv[0].stats.sampling_rate)
 
     start_time = time.time()
+    # RR: why?
     wv = wv.select(location=wv[0].stats.location)
     wv.remove_response(output="VEL", pre_filt=pre_filt, water_level=None)# 60
     if verbose:
@@ -349,6 +356,7 @@ def process_seismic_data(network, station, channel, start_time, duration, verbos
     start_time = time.time()
     if wv[0].stats.sampling_rate > 100:
         wv.resample(100)  # pre filter
+    
     wv.trim(wv[0].stats.starttime+buffer, wv[0].stats.endtime-buffer)
     if verbose:
         print("Downsampling --- %s seconds ---" %  (time.time() - start_time))
@@ -361,7 +369,10 @@ def process_seismic_data(network, station, channel, start_time, duration, verbos
     start_time = time.time()
     duration_seconds = wv[0].stats.endtime - wv[0].stats.starttime
     duration_samples = sampling_rate * duration_seconds
-
+    
+    # RR: some kind of gap handling and sanity check needed here
+    
+    
     num_segments = int((2 * duration_samples / len_sample))
 
     # collect components and sort Z as first
@@ -375,11 +386,13 @@ def process_seismic_data(network, station, channel, start_time, duration, verbos
         print(components)
 
     # get waveform data
+    # RR: not sure that this is always correct in case of Z, 1, 2 or Z, 2, 3
     data_z = wv.select(component=components[0])[0].data
     data_n = wv.select(component=components[1])[0].data
     data_e = wv.select(component=components[2])[0].data
 
     # get start times of time windows
+    # RR: vecrtorise this and others
     utc_start_list = []
     for n in range(num_segments):
         utc_start_list.append(wv[0].stats.starttime+n*shift_samples/sampling_rate)
@@ -440,6 +453,10 @@ def process_seismic_data(network, station, channel, start_time, duration, verbos
             if bin_start >250:
                 index_window += 2
                 bin_start = 0
+          
+            if index_window >= len(y_predict):
+                continue
+
 
             selected_masks.append(y_predict[index_window])
             selected_stft.append(stft_collection[index_window])
@@ -451,11 +468,15 @@ def process_seismic_data(network, station, channel, start_time, duration, verbos
                 plt.axvline((detection_start[-1]-selected_utc[-1])/bin_spacing)
         else:
             index_window = int(2 * (filtered_result[1] // 256) + 1)
+
             bin_start = filtered_result[1] % 256
 
             if bin_start >250:
                 index_window += 2
                 bin_start = 0
+            if index_window >= len(y_predict):
+                continue
+
 
             selected_masks.append(y_predict[index_window])
             selected_stft.append(stft_collection[index_window])
@@ -488,19 +509,23 @@ def process_seismic_data(network, station, channel, start_time, duration, verbos
     # wv_snippets = []#obspy.Stream()#[]
     stream_start_end = []
     new_window_start = []
-    for _utc in detection_start:
+    stft_collection_subset = np.zeros((len(detection_start), 64, 256, 6), dtype=np.float32)
+    stft_norm_collection_subset = np.zeros((len(detection_start), 64, 256, 6), dtype=np.float32)
+
+    for i, _utc in enumerate(detection_start):
 
         stft_tmp, stft_tmp_norm = np.zeros((64, 256, 6)), np.zeros((64, 256, 6))
-        wv_snippet = wv.copy()
 
-        wv_snippet.trim(_utc-shift_seconds,_utc+(65-shift_seconds),pad=True,fill_value=0)
+        wv_snippet = wv.slice(_utc-shift_seconds,_utc+(65-shift_seconds),keep_empty_traces=True,nearest_sample=False,)
         new_window_start.append(_utc-shift_seconds)
 
         data_z = wv_snippet.select(component=components[0])[0].data
         data_n = wv_snippet.select(component=components[1])[0].data
         data_e = wv_snippet.select(component=components[2])[0].data
 
-
+        # RR better for the future: Check for skipped data first, remove it and then run the rest
+        # needs better data structure to keep this
+        
         for j, data in enumerate([data_z,data_n,data_e]):
             snippet_tmp = data[:len_sample]
 
@@ -508,27 +533,36 @@ def process_seismic_data(network, station, channel, start_time, duration, verbos
                 if verbose:
                     print("skipped:", j)
                 continue
-            f, t, _stft = scipy.signal.stft(snippet_tmp, **stft_parameters)
-            # original
-            stft_tmp[:,:,j*2] = _stft.real
-            stft_tmp[:,:,j*2+1] = _stft.imag
 
-            # norm
-            stft_tmp_1c = np.stack((_stft.real, _stft.imag),axis=2)
-            stft_tmp_1c = normalize_percentile(stft_tmp_1c)
-            stft_tmp_norm[:,:,j*2] = stft_tmp_1c[:,:,0]
-            stft_tmp_norm[:,:,j*2+1] = stft_tmp_1c[:,:,1]
 
-        stft_tmp = np.expand_dims(stft_tmp, axis=0)
-        stft_tmp_norm = np.expand_dims(stft_tmp_norm, axis=0)
-        if first_stft:
-            stft_collection_subset = stft_tmp
-            stft_norm_collection_subset = stft_tmp_norm
+            _, _, _stft = scipy.signal.stft(snippet_tmp, **stft_parameters)
+            re = _stft.real
+            im = _stft.imag
 
-            first_stft = False
-        else:
-            stft_collection_subset = np.concatenate((stft_collection_subset, stft_tmp), axis=0)
-            stft_norm_collection_subset = np.concatenate((stft_norm_collection_subset, stft_tmp_norm), axis=0)
+            block = np.stack((re, im), axis=2) 
+            block_norm = normalize_percentile(block)
+
+            stft_tmp[:,:,j*2:j*2+2] = block
+            stft_tmp_norm[:,:,j*2:j*2+2] = block_norm
+
+
+
+        #stft_tmp = np.expand_dims(stft_tmp, axis=0)
+        #stft_tmp_norm = np.expand_dims(stft_tmp_norm, axis=0)
+
+        stft_collection_subset[i] = np.expand_dims(stft_tmp, axis=0)
+        stft_norm_collection_subset[i] = np.expand_dims(stft_tmp_norm, axis=0)
+
+        # O(n**2)
+        #if first_stft:
+        #    stft_collection_subset = stft_tmp
+        #    stft_norm_collection_subset = stft_tmp_norm
+        #    first_stft = False
+        #else:
+        # O(n**2)
+        #   stft_collection_subset = np.concatenate((stft_collection_subset, stft_tmp), axis=0)
+        #   stft_norm_collection_subset = np.concatenate((stft_norm_collection_subset, stft_tmp_norm), axis=0)
+         
         stream_start_end.append([wv_snippet[0].stats.starttime,wv_snippet[0].stats.endtime])
 
 
@@ -605,8 +639,7 @@ def process_seismic_data(network, station, channel, start_time, duration, verbos
     st_denoised_collection = obspy.Stream()
 
     for i in range(num):
-        st_denoised = wv.copy()
-        st_denoised.trim(utc_start_subset[i],utc_start_subset[i]+61.19)
+        st_denoised = wv.slice(utc_start_subset[i],utc_start_subset[i]+61.19)
         for j in range(3):
             _stft = stft_final_subset[i, :, :, j * 2] + 1j * stft_final_subset[i, :, :, j * 2 + 1]
             # _stft_denoised = _stft * masks_subset[i, :, :, j * 2]
@@ -676,9 +709,9 @@ def process_seismic_data(network, station, channel, start_time, duration, verbos
 
     if saveraw=="True" or saveraw=="true":
         wv.write(dir_tmp + wv[0].id[:-1] + "_original.mseed",format="MSEED")
-
-    trimmed_streams.merge().plot()
-    wv.plot()
+# RR have this as an option
+#    trimmed_streams.merge().plot()
+#    wv.plot()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Denoise seismic data for specified network, station, and channel.")
@@ -701,18 +734,35 @@ if __name__ == "__main__":
     # Parsing arguments
     args = parser.parse_args()
 
+    # RR: duration must be a multiple of 61.2 for best results
+    duration = float(args.duration)
+    duration_old = duration
+    duration = math.ceil(duration / 61.2) * 61.2
+    if duration > duration_old:
+        warnings.warn(f"Duration rounded to next multiple of 61.2: {duration}")
+
+ #   tracemalloc.start()
+    
+#    snapshot_before = tracemalloc.take_snapshot()
+
     # Calling the main function
     process_seismic_data(args.network,
                          args.station,
                          args.channel,
                          args.start_time,
-                         args.duration,
+                         duration,
                          args.verbose,
                          args.threshold,
                          args.saveraw,
                          args.model_name,
                          args.min_peak_height,
                          args.client_str)
+    
+#    snapshot_after = tracemalloc.take_snapshot()
 
+ #   stats = snapshot_after.compare_to(snapshot_before, "lineno")
+
+ #   for s in stats[:50]:
+ #       print(s)
 
 # %%
