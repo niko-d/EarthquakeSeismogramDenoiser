@@ -241,7 +241,7 @@ def process_segment(i):
     return np.expand_dims(stft_tmp, axis=0), np.expand_dims(stft_tmp_norm, axis=0)
 
 
-def process_seismic_data(network, station, channel, start_time, duration, verbose, threshold,saveraw,model_name,min_peak_height=0.1,client_str="ETH"):
+def process_seismic_data(network, station, channel, start_time, duration, verbose, threshold,saveraw,model_name,min_peak_height=0.33,client_str="ETH"):
     """
     Download, preprocess, denoise, and detect seismic signals from waveform data using a deep learning model.
 
