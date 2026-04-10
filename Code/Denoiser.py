@@ -1,5 +1,5 @@
 import obspy.core
-# import cupy as cp
+import cupy as cp
 import numpy as np
 import scipy
 import time
@@ -267,9 +267,7 @@ class Denoiser(object):
 
         for trace in data:
             channel = trace.data
-
-            # maybe float32 is enough?
-            channel = channel.astype(np.float64)
+            channel = channel.astype(np.float32)
             channel -= channel.mean()
             channel *= taper_coeffs
             spec = np.fft.rfft(channel, n=nfft)
