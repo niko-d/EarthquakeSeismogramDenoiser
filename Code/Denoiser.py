@@ -693,7 +693,7 @@ class Denoiser(object):
             new_window_start.append(_utc-shift_seconds)
             data_window = data_stack[startidx:endidx, :]
             if len(data_window) < self.len_sample:
-                print("Not enough data, skipping")
+                logger.info("Not enough data, skipping")
                 continue
             stft_tmp, stft_tmp_norm = self._process_segment(data_window)
             stft_collection_subset[i] = np.expand_dims(stft_tmp, axis=0)
@@ -706,7 +706,8 @@ class Denoiser(object):
                 stream_start_end)
 
     def _make_final_selection(self, y_predict_event, filtered_results,
-                              selected_stft, selected_masks, selected_utc,
+                              detection_start, selected_stft,
+                              selected_masks, selected_utc,
                               stft_collection_subset, stream_start_end, data):
         """
         Choose the best out of all computed results for a given earthquake.
@@ -714,6 +715,7 @@ class Denoiser(object):
 
         logger.debug("")
         stft_final_subset, masks_subset, utc_start_subset = [], [], []
+        stream_start_end_final = []
         for i, y_event in enumerate(y_predict_event):
             _timeseries = (2 * np.max(y_event[:, :, 0], axis=0) +
                            np.max(y_event[:, :, 1], axis=0) +
@@ -737,10 +739,21 @@ class Denoiser(object):
                     stft_final_subset.append(selected_stft[i])
                     masks_subset.append(selected_masks[i])
                     utc_start_subset.append(selected_utc[i])
+                    detect_duration = filtered_results[i][2] -\
+                        filtered_results[i][1]
+                    stream_start_end_final.append((detection_start[i],
+                                                   detection_start[i] +
+                                                   detect_duration))
                 else:
                     stft_final_subset.append(stft_collection_subset[i])
                     masks_subset.append(y_event)
                     utc_start_subset.append(stream_start_end[i][0])
+                    stream_start_end_final.append([stream_start_end[i][0] +
+                                                   _peak[0][1] *
+                                                   self.bin_spacing,
+                                                   stream_start_end[i][0] +
+                                                   _peak[0][2] *
+                                                   self.bin_spacing])
 
         masks_subset = np.array(masks_subset)
         stft_final_subset = np.array(stft_final_subset)
@@ -774,15 +787,11 @@ class Denoiser(object):
         sorted_indices = sorted(range(len(segments)),
                                 key=lambda i: start_times[i])
         trimmed_streams = obspy.core.Stream()
+        _tmp_stream = []
         for i in sorted_indices:
             trimmed_streams += segments[i]
-        return trimmed_streams
-
-    def _remove_overlaps(self, trimmed_streams):
-        """
-        Not yet implemented
-        """
-        pass
+            _tmp_stream.append(stream_start_end_final[i])
+        return (trimmed_streams, _tmp_stream)
 
     def _output(self, starttime, trimmed_streams):
         """
@@ -790,18 +799,76 @@ class Denoiser(object):
         """
 
         logger.debug("")
+
+        output_stream = obspy.core.Stream()
+        for i in range(3):
+            for j in range(int(len(trimmed_streams) // 3)):
+                output_stream += trimmed_streams[3*j + i]
+        output_stream._cleanup()
         if not len(trimmed_streams):
             logger.debug("No events found")
             return
         dir_tmp = str(Path(self.model_name).parent /
                       ("DOY" + str(starttime.julday).zfill(3))) + "/"
         check_dir(dir_tmp)
-        print(trimmed_streams)
-        trimmed_streams.write(dir_tmp +
-                              trimmed_streams[0].id[:-1] +
-                              "_denoised.mseed",
-                              format="MSEED")
-        # trimmed_streams.plot()
+        output_stream.write(dir_tmp +
+                            trimmed_streams[0].id[:-1] +
+                            "_denoised.mseed",
+                            format="MSEED")
+
+    def _trim_streams(self, trimmed_streams, startstop):
+        """
+        Handle cases where traces of two subsequent picks overlap
+        """
+
+        logger.debug("")
+        new_trimmed_stream = obspy.core.Stream()
+        for i in range(0, len(startstop)-1):
+            # no overlap
+            if trimmed_streams[3*i].stats.endtime < \
+                    trimmed_streams[3*(i+1)].stats.starttime:
+                for j in range(0, 3):
+                    new_trimmed_stream += trimmed_streams[3*i+j]
+                logger.debug("No overlap")
+                continue
+
+            # overlap, but signal part of preceding set ends
+            # before start of next data set
+            if startstop[i][1] < trimmed_streams[3*(i+1)].stats.starttime:
+                logger.debug("No signal overlap with next stream")
+                for j in range(0, 3):
+                    new_trimmed_stream += trimmed_streams[3*i+j].slice(
+                        endtime=startstop[i][1]-0.01)
+            # overlap, but signal part of preceding set ends before signal
+            # part of next data set
+            elif startstop[i][1] + 3 < startstop[i+1][0]:
+                logger.debug("no signal overlap")
+
+                for j in range(0, 3):
+                    new_trimmed_stream += \
+                        trimmed_streams[3*i+j].slice(
+                            endtime=startstop[i][1] - 0.01
+                            )
+                    trimmed_streams[3*(i+1)+j] = \
+                        trimmed_streams[3*(i+1)+j].slice(
+                            starttime=startstop[i+1][0] - 3
+                            )
+            # overlap not resolvable
+            else:
+                logger.debug("signal overlap")
+                for j in range(0, 3):
+                    new_trimmed_stream += \
+                        trimmed_streams[3*i+j].slice(
+                            endtime=startstop[i+1][1] - 3 - 0.01
+                            )
+                    trimmed_streams[3*(i+1)+j] = \
+                        trimmed_streams[3*(i+1)+j].slice(
+                            starttime=startstop[i+1][0] - 3
+                            )
+        if len(startstop) > 1:
+            for j in range(0, 3):
+                new_trimmed_stream += trimmed_streams[3*i+j]
+        return new_trimmed_stream
 
     def run_timerange(self, network, station, location, channel,
                       startday, endday):
@@ -879,16 +946,18 @@ class Denoiser(object):
         # Make new prediction
         y_predict_event = self.model.predict(stft_norm_collection_subset,
                                              verbose=model_verbose)
-        # make final selection
-        trimmed_streams = self._make_final_selection(y_predict_event,
-                                                     filtered_results,
-                                                     selected_stft,
-                                                     selected_masks,
-                                                     selected_utc,
-                                                     stft_collection_subset,
-                                                     stream_start_end, data)
 
-        # trimming needs to be reimplemented to fit current data strucutre
+        trimmed_streams, stream_start_end = \
+            self._make_final_selection(y_predict_event,
+                                       filtered_results,
+                                       detection_start,
+                                       selected_stft,
+                                       selected_masks,
+                                       selected_utc,
+                                       stft_collection_subset,
+                                       stream_start_end, data)
+
+        trimmed_streams = self._trim_streams(trimmed_streams, stream_start_end)
 
         # output
         self._output(data[0].stats.starttime, trimmed_streams)
