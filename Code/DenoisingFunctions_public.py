@@ -151,14 +151,19 @@ def stream_tta(_event_stream, _noise_stream,id=0,white_noise_factor=0.01,constan
     """
     # Copy the event stream to avoid modifying the original data
     _event_noiseinjected = _event_stream.copy()
+
+    # Create a local RNG seeded by id — reproducible per augmentation index
+    rng = np.random.default_rng(seed=id)
+
     # Iterate over the event stream and corresponding noise traces
     for tr_denoised, tr_noise in zip(_event_noiseinjected, _noise_stream):
         # Inject noise: multiply noise trace's running standard deviation by random Gaussian noise
         if constant_noise:
-            tr_denoised.data += white_noise_factor * np.std(tr_noise.data) * np.random.randn(
+            tr_denoised.data += white_noise_factor * np.std(tr_noise.data) * rng.standard_normal(
                 len(tr_denoised.data))
         else:
-            tr_denoised.data += white_noise_factor * running_std_causal(tr_noise.data, 10000) * np.random.randn(len(tr_denoised.data))
+            tr_denoised.data += white_noise_factor * running_std_causal(tr_noise.data, 10000) * rng.standard_normal(
+                len(tr_denoised.data))
 
         # Update metadata: Assign a formatted ID to the 'location' field
         tr_denoised.stats.location = str(id).zfill(2)
