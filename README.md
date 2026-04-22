@@ -37,7 +37,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Windows:
+Windows (not tested on Windows):
 ```bash
 python -m venv eqs
 eqs\Scripts\activate
