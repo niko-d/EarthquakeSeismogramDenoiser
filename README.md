@@ -37,7 +37,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Windows (not tested on Windows):
+Windows (not tested on Windows; ProcessPoolExecutor needs to be adjusted):
 ```bash
 python -m venv eqs
 eqs\Scripts\activate
