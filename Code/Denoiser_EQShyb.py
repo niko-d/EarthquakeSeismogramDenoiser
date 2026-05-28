@@ -6,6 +6,7 @@ import time
 import logging
 import threading
 import queue
+import json                                         # NEW: for _save_picks()
 import tensorflow as tf
 from tensorflow.keras.layers import Layer
 from obspy.signal.invsim import cosine_taper, cosine_sac_taper
@@ -15,7 +16,10 @@ from DenoisingFunctions_public import check_dir, normalize_percentile
 from scipy.signal import find_peaks
 from pathlib import Path
 from scipy.signal import istft
-
+from obspy.signal.invsim import cosine_taper, cosine_sac_taper
+from obspy.signal.util import _npts2nfft
+from obspy import Stream, Trace  # NEW: used in _stream_tta()
+from concurrent.futures import ThreadPoolExecutor, as_completed  # NEW: used in _process_picks()
 tf.config.set_visible_devices([], 'GPU')
 _PROGRAM_START = time.perf_counter()
 
@@ -23,18 +27,178 @@ logger = logging.getLogger(__name__)
 
 SENTINEL = object()
 
-# run_data()
-#  ├── _get_data()
-#  ├── _compute_stfts()
-#  ├── _detect_event_signals()
-#  ├── _select_data_and_mask()
-#  ├── _recompute_mask()
-#  ├── model.predict()              ← EQS second pass
-#  ├── _make_final_selection()      ← window scoring/selection only, returns arrays
-#  ├── _apply_eqshyb()              ← optional, only if eqs2_model loaded
-#  ├── _build_streams()             ← stream construction, EQS or EQShyb path
-#  └── _trim_streams()
 
+# run_data()
+#  ├── _round_to_window()               ← snap endtime to exact multiple of 61.2 s
+#  ├── _get_data()                      ← fetch, resample, remove response, gap detection
+#  ├── _compute_stfts()                 ← sliding window STFT over full day
+#  ├── _detect_event_signals()          ← EQS first pass, peak detection on mask timeseries
+#  ├── _select_data_and_mask()          ← select best STFT window per detection
+#  ├── _recompute_mask()                ← re-align window to estimated signal start
+#  ├── model.predict()                  ← EQS second pass on re-aligned windows
+#  ├── _make_final_selection()          ← window scoring/selection, returns arrays; A ≤ D accepted
+#  ├── _apply_eqshyb()                  ← optional, only if eqs2_model loaded and A > 0
+#  |    └── eqs2_model.predict()        ← hybrid time-domain refinement (inputs: noisy + EQS denoised + EQS mask)
+#  ├── _build_streams()                 ← ISTFT + stream assembly, EQS or EQShyb path; sorts by starttime
+#  ├── _trim_streams()                  ← resolve overlapping detections, apply signal buffer
+#  ├── _output()                        ← zero-fill gaps, write MiniSEED to disk
+#  ├── _pick()                          ← optional, only if picker configured and snippets exist
+#  |    ├── _get_designaled_noise()     ← per-snippet noise = original - denoised
+#  |    └── _process_picks()            ← parallel TTA picking loop (ThreadPoolExecutor)
+#  |         └── _process_snippet()    ← per-detection: TTA augmentation + phase picking + polarity
+#  |              ├── _stream_tta()    ← inject std-scaled white noise, seeded by TTA id
+#  |              ├── picker.annotate()           ← SeisBench batch annotation
+#  |              ├── picker.classify_aggregate() ← aggregate TTA picks
+#  |              ├── _process_peak_times()       ← cluster picks + uncertainty per phase
+#  |              |    ├── _cluster_picks()       ← group nearby picks, one per event
+#  |              |    |    └── _weighted_median() ← confidence-weighted pick time
+#  |              |    └── _tta_uncertainty()     ← timing spread across TTA reps
+#  |              |         └── _weighted_std()  ← confidence-weighted std
+#  |              └── _predict_polarity_tta()     ← optional, per accepted P pick; reuses TTA Z collection
+#  └── _save_picks()                    ← scale uncertainties, write picks JSON to disk (same DOY directory)
+
+# removed
+#  ├── _filter_close_detections_streams() ← drop detections too close to resolve in trimming
+
+
+def apply_pre_filt(data, samp_rate, pre_filt):
+    """Apply ObsPy's remove_response pre_filt step (no response correction).
+
+    Calls ObsPy functions directly. Reproduces the pre_filt block of
+    obspy.core.trace.Trace.remove_response with defaults:
+        zero_mean=True, taper=True, taper_fraction=0.05
+
+    Parameters
+    ----------
+    data      : array-like        Raw time-domain signal.
+    samp_rate : float             Sample rate in Hz.
+    pre_filt  : (f1, f2, f3, f4) Bandpass corner frequencies in Hz.
+
+    Returns
+    -------
+    ndarray float64  Pre-filtered signal in the time domain.
+    """
+    data = np.array(data, dtype=np.float64)
+    npts = len(data)
+
+    data -= data.mean()
+    data *= cosine_taper(npts, p=0.05, sactaper=True, halfcosine=False)
+
+    nfft  = _npts2nfft(npts)
+    spec  = np.fft.rfft(data, n=nfft)
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / samp_rate)
+
+    spec *= cosine_sac_taper(freqs, flimit=pre_filt)
+
+    return np.fft.irfft(spec)[0:npts]
+
+
+def apply_pre_filt_trace(trace, pre_filt):
+    """Apply pre_filt to a single ObsPy Trace, returns a new Trace.
+
+    Parameters
+    ----------
+    trace    : obspy.Trace        Input trace (not modified).
+    pre_filt : (f1, f2, f3, f4)  Bandpass corner frequencies in Hz.
+
+    Returns
+    -------
+    obspy.Trace  Copy with pre-filtered data (float64).
+    """
+    out = trace.copy()
+    out.data = apply_pre_filt(trace.data, trace.stats.sampling_rate, pre_filt)
+    return out
+
+
+def apply_pre_filt_stream(stream, pre_filt):
+    """Apply pre_filt to every trace in an ObsPy Stream, returns a new Stream.
+
+    Parameters
+    ----------
+    stream   : obspy.Stream       Input stream (not modified).
+    pre_filt : (f1, f2, f3, f4)  Bandpass corner frequencies in Hz.
+
+    Returns
+    -------
+    obspy.Stream  New stream with pre-filtered traces (float64).
+    """
+    return Stream([apply_pre_filt_trace(tr, pre_filt) for tr in stream])
+
+def _predict_polarity_tta(
+    z_tta_collection,
+    z_starttime,
+    z_sampling_rate,
+    p_pick,
+    polarity_model,
+    win=256,
+    threshold=0.33,
+):
+    """
+    Polarity prediction using the already-augmented TTA Z traces from
+    _stream_tta — no re-augmentation or noise re-scaling needed.
+
+    z_tta_collection  : obspy.Stream, full TTA collection from _stream_tta,
+                        containing repeat Z/N/E augmented traces
+    z_starttime       : obspy.UTCDateTime, starttime of the original Z snippet
+                        (before the +add padding in _process_snippet)
+    z_sampling_rate   : float, samples per second
+    p_pick            : obspy.UTCDateTime, accepted P pick time
+    polarity_model    : tf.keras.Model, input shape (batch, win) or (batch, win, 1)
+    win               : int, sample window centred on P pick (default 256)
+    threshold         : float, min winning class probability; below → undecidable
+
+    Returns dict:
+        label            : str, 'positive' | 'negative' | 'undecidable'
+        probabilities    : np.ndarray shape (3,), mean softmax over TTA batch
+        all_predictions  : np.ndarray shape (repeat, 3), per-repetition softmax
+    """
+    labels = np.array(["negative", "undecidable", "positive"])
+
+    p_idx = int(round((p_pick - z_starttime) * z_sampling_rate))
+    half  = win // 2
+
+    batch = []
+    for tr in z_tta_collection.select(component='Z'):
+        z = np.asarray(tr.data, dtype=np.float32)
+        z_win = np.zeros(win, dtype=np.float32)
+        start = p_idx - half
+        src0  = max(start, 0)
+        src1  = min(start + win, z.shape[0])
+        dst0  = src0 - start
+        z_win[dst0: dst0 + (src1 - src0)] = z[src0:src1]
+        batch.append(z_win)
+
+    z_batch = np.stack(batch, axis=0)                                    # (repeat, win)
+    abs_max = np.maximum(np.max(np.abs(z_batch), axis=1, keepdims=True), 1e-20)
+    z_batch /= abs_max
+
+    if polarity_model.input_shape[-1] == 1:
+        z_batch = z_batch[:, :, np.newaxis]                              # (repeat, win, 1)
+
+    pred      = polarity_model(z_batch, training=True).numpy()           # (repeat, 3)
+    mean_pred = pred.mean(axis=0)                                        # (3,)
+
+    label = labels[np.argmax(mean_pred)]
+    if mean_pred.max() < threshold:
+        label = "undecidable"
+
+    return {
+        "label":           label,
+        "probabilities":   mean_pred,
+        "all_predictions": pred,
+    }
+
+
+class MaxAbsNorm1D(tf.keras.layers.Layer):
+    def __init__(self, eps=1e-6, **kwargs):
+        super().__init__(**kwargs)
+        self.eps = eps
+
+    def call(self, x):
+        # x: (B, T, C)
+        m = tf.reduce_max(tf.abs(x), axis=1, keepdims=True)
+        m = tf.maximum(m, self.eps)
+        return x / m
 
 @tf.keras.utils.register_keras_serializable(package="custom")
 class ReflectPad1D(Layer):
@@ -111,16 +275,27 @@ class Denoiser(object):
     """
 
     def __init__(self, data_client, metadata_client,
-                 model_path, min_peak_height, eqs2_model_path=None, debug=False):
+                 model_path, min_peak_height, eqs2_model_path=None,
+                 picker=None, picking_kwargs=None,
+                 polarity_model_path=None, polarity_kwargs=None,
+                 debug=False):
         """
-        data_client: obspy client to get data, SDS might be fastest if
-        you use obspy >= 1.5.0
-
-        metadata_client: obspy client to get metadata, e.g. fdsn web
-                         service
-        model_path: path to trained model
-        # threshold:
-        min_peak_height:
+        data_client          : obspy client to get data
+        metadata_client      : obspy client to get metadata
+        model_path           : path to trained EQS model
+        min_peak_height      : min peak height for detection
+        eqs2_model_path      : optional path to EQShyb model
+        picker               : optional SeisBench picker for phase picking
+        picking_kwargs       : optional dict of kwargs passed to _process_picks
+        polarity_model_path  : optional path to polarity model; if given the
+                               model is loaded and applied to every accepted
+                               P pick; expects input (batch, 256) or
+                               (batch, 256, 1)
+        polarity_kwargs      : optional dict, currently supports key
+                               'threshold' (float, default 0.33) — minimum
+                               winning class probability to accept a polarity
+                               label, below which 'undecidable' is returned
+        debug                : enable verbose logging
         """
 
         self.min_peak_height = min_peak_height
@@ -133,11 +308,13 @@ class Denoiser(object):
         self.bins_overlap = 128
         self.model_name = model_path
         self.pre_filt = [1 / 100, 1 / 20, 45, 50]
-        self.stft_parameters = {"nperseg": 48, "nfft": 126, "fs": 100,
-                                "noverlap": 24}
+        self.stft_parameters = {"nperseg": 48, "nfft": 126, "fs": 100,"noverlap": 24}
         self.REALIGN_SCORE_TOLERANCE = 0.5#1 # 0.5 # NEW added
-        self.signal_buffer_s = 3.0
+        self.signal_buffer_s = 3.0  # buffer to start save denoised stream with at least 3s before signal start (ideally)
         self.one_sample_s = 1.0 / self.stft_parameters["fs"]  # = 0.01s at 100 Hz
+
+        # calibrated uncertainties
+        # timing_uncertainty_p =  (4 * 1.904 * initial_std_p + 9.249) / 100  timing_uncertainty_s =  (4 * 2.211 * initial_std_s + 3.6) / 100  # XXL low SNR
 
         # t = np.linspace(0, 61.2, 256)  # OLD
         # self.bin_spacing = (255/256) * (t[1]-t[0])  # OLD
@@ -146,11 +323,30 @@ class Denoiser(object):
         self.response_cache = {}
         self.model = tf.keras.models.load_model(model_path, compile=False)
 
+        # EQShyb / EQS2
         self.eqs2_model = tf.keras.models.load_model(
             eqs2_model_path,
             custom_objects={"ReflectPad1D": ReflectPad1D},
             compile=False
         ) if eqs2_model_path else None
+
+        # PICKER
+        self.picker = picker
+        self.picking_kwargs = picking_kwargs or {}
+        self.uncertainty_scaling = {
+            'p_picks': {'scale_sample': 4*1.904, 'offset_sample': 9.249},
+            's_picks': {'scale_sample': 4*2.211, 'offset_sample': 3.600},
+        }
+        # POLARITY
+        self.polarity_model = tf.keras.models.load_model(
+            polarity_model_path,
+            custom_objects={"custom>MaxAbsNorm1D": MaxAbsNorm1D},
+            compile=False
+        ) if polarity_model_path else None
+        self.polarity_threshold = (polarity_kwargs or {}).get('threshold', 0.33)
+
+
+        self.components = None  # set in _get_data()
 
 
         setup_logging(debug=debug)
@@ -365,7 +561,7 @@ class Denoiser(object):
         data_window: numpy array of shape (len_sample, 3)
                      Columns are Z, N, E components.
         Returns:
-                (raw_stft, norm_stft) each shaped (1, 64, 256, 6)
+                (raw_stft, norm_stft) each shaped (64, 256, 6)
         """
 
         logger.debug("")
@@ -404,7 +600,7 @@ class Denoiser(object):
         #     stft_tmp_norm[np.newaxis, ...]
         #     )
 
-    def compare_arrays_time_overlap(self, array1, array2, overlap=0.75):
+    def _compare_arrays_time_overlap(self, array1, array2, overlap=0.75):
         """
         Compare two arrays of time intervals and select overlapping
         intervals with higher scores.
@@ -482,7 +678,7 @@ class Denoiser(object):
 
         return final_rows, origins
 
-    def get_mask_timeseries(self, mask_array):
+    def _get_mask_timeseries(self, mask_array):
         """
         Extract two time series from a 4D mask array by computing a
         weighted mean of maximum mask values across selected channels
@@ -584,7 +780,7 @@ class Denoiser(object):
         gap_list = data.get_gaps()
         gap_intervals = [(g[4], g[5]) for g in gap_list]
         # data.merge(fill_value='interpolate', method=1)
-        data.merge(fill_value='0', method=1)
+        data.merge(fill_value=0, method=1)
 
         if len(data) != 3:
             logger.debug("Couldn't receive all data for "
@@ -595,17 +791,20 @@ class Denoiser(object):
         metadata = self._get_metadata(network, station, location,
                                       f"{channel}?", starttime, starttime)
 
+        # apply filter as in obspy remove_response prefilter & remove any other AA filter
+        ...
+        data = apply_pre_filt_stream(data, self.pre_filt)
         if data[0].stats.sampling_rate % 100 == 0:
             # data.filter("lowpass", freq=45.0, corners=4, zerophase=True)  # OLD
-            data.filter("lowpass", freq=45.0, corners=8, zerophase=False)  # NEW
+            # data.filter("lowpass", freq=45.0, corners=8, zerophase=False)  # NEW
             # OR decimate anti aliasing filter, similar to tr.filter('lowpass_cheby_2', freq=45.0, maxorder=12)
             # freq = self.stats.sampling_rate * 0.5 / float(factor)
             # self.filter('lowpass_cheby_2', freq=freq, maxorder=12) ???
             data.decimate(factor=int(data[0].stats.sampling_rate // 100),
-                          no_filter=True)
+                          no_filter=False)
         else:
             # data.filter("lowpass", freq=45.0, corners=8, zerophase=False)  # NEW - add filter ???
-            data.resample(100)
+            data.resample(100,no_filter=True) # no filter default, additioonal AA off by frequency taper
 
         self._fast_remove_response(data, metadata)
         data.trim(data[0].stats.starttime + buffer,
@@ -619,12 +818,12 @@ class Denoiser(object):
         #                               data[1].data,
         #                               data[2].data])
 
-        components = sorted([tr.stats.channel[-1] for tr in data], reverse=True)  # NEW get components and fix order in data
+        self.components = sorted([tr.stats.channel[-1] for tr in data], reverse=True)  # NEW get components and fix order in data
         # z comp first, other componets abitrarily
         data_stack = np.column_stack([
-            data.select(component=components[0])[0].data,
-            data.select(component=components[1])[0].data,
-            data.select(component=components[2])[0].data
+            data.select(component=self.components[0])[0].data,
+            data.select(component=self.components[1])[0].data,
+            data.select(component=self.components[2])[0].data
         ])
 
         # return (data, data_stack)  # OLD
@@ -677,9 +876,14 @@ class Denoiser(object):
         y_predict = self.model.predict(stft_norm_collection,
                                        verbose=model_verbose)
         mask_timeseries_even, mask_timeseries_odd = \
-            self.get_mask_timeseries(y_predict)
+            self._get_mask_timeseries(y_predict)
+
+        mid = len(mask_timeseries_even) // 2
+        logger.info(f"mask timeseries even: first half max={mask_timeseries_even[:mid].max():.3f}, "
+                    f"second half max={mask_timeseries_even[mid:].max():.3f}")
+
         # get peaks with start and end, with fixed min. threshold
-        # of 0.1 for max of time series (=at leats one bin with mask value>0.1)
+        #  for max of time series (=at leats one bin with mask value>0.1)
 
         # account for 50% time shift
         peak_info_even = self.get_peaks(mask_timeseries_even,
@@ -689,7 +893,16 @@ class Denoiser(object):
                                        threshold=self.min_peak_height,
                                        shift_correction=0)
         filtered_results, origin = \
-            self.compare_arrays_time_overlap(peak_info_even, peak_info_odd)
+            self._compare_arrays_time_overlap(peak_info_even, peak_info_odd)
+
+        logger.info(f"_detect_event_signals: {len(filtered_results)} detections found "
+                    f"(even peaks: {len(peak_info_even)}, odd peaks: {len(peak_info_odd)})")
+        if len(filtered_results):
+            logger.info(f"  peak index range: {filtered_results[:, 0].min():.0f} — {filtered_results[:, 0].max():.0f} "
+                        f"(of {len(mask_timeseries_even) + len(mask_timeseries_odd)} total bins; "
+                        f"bin spacing {self.bin_spacing}s → "
+                        f"last detection ~{filtered_results[:, 0].max() * self.bin_spacing / 3600:.1f}h into data)")
+
         return (filtered_results, origin, y_predict)
 
     def _select_data_and_mask(self, filtered_results, origin, y_predict,
@@ -717,6 +930,9 @@ class Denoiser(object):
                 bin_start = 0
 
             if index_window >= len(y_predict):
+                logger.info(f"_select_data_and_mask: {len(detection_start)} selected from "
+                            f"{len(filtered_results)} detections "
+                            f"({len(filtered_results) - len(detection_start)} dropped: index out of range)")
                 continue
 
             selected_masks.append(y_predict[index_window])
@@ -740,16 +956,16 @@ class Denoiser(object):
         # 10  # trying to align estimated signal start with binning
         shift_seconds = self.bin_spacing*42
         stream_start_end = []
-        new_window_start = []
+        # new_window_start = []
         stft_collection_subset = np.zeros((len(detection_start),
                                            64, 256, 6), dtype=np.float32)
         stft_norm_collection_subset = np.zeros((len(detection_start),
                                                 64, 256, 6), dtype=np.float32)
         for i, _utc in enumerate(detection_start):
             # find start and end index
-            startidx = int((_utc - starttime - shift_seconds) * 100)
+            startidx = int((_utc - starttime - shift_seconds) * self.stft_parameters["fs"])
             endidx = startidx + 6120
-            new_window_start.append(_utc-shift_seconds)
+            # new_window_start.append(_utc-shift_seconds)
             data_window = data_stack[startidx:endidx, :]
             if len(data_window) < self.len_sample:
                 logger.info("Not enough data, skipping")
@@ -848,8 +1064,8 @@ class Denoiser(object):
         use_eqshyb = (denoised_hyb is not None) and (num > 0)
 
         for i in range(num):
-            for j in range(3):
-                stats = data[j].stats.copy()  # copy to avoid mutating original stats
+            for j, comp in enumerate(self.components):
+                stats = data.select(component=comp)[0].stats.copy()
                 stats.starttime = utc_start_subset[i]
 
                 if use_eqshyb:
@@ -864,9 +1080,11 @@ class Denoiser(object):
                 st_denoised_collection += obspy.core.Trace(trace_data, header=stats)
 
         segments = [st_denoised_collection[3 * i: 3 * (i + 1)] for i in range(num)]
-        start_times = [seg[0].stats.starttime for seg in segments]
-        sorted_indices = sorted(range(len(segments)), key=lambda i: start_times[i])
+        # start_times = [seg[0].stats.starttime for seg in segments]
+        start_times = [seg.select(component=self.components[0])[0].stats.starttime for seg in segments]
 
+        # sorted_indices = sorted(range(len(segments)), key=lambda i: start_times[i])
+        sorted_indices = sorted(range(len(segments)), key=lambda i: stream_start_end_final[i][0])
         trimmed_streams = obspy.core.Stream()
         stream_start_end_sorted = []
         for i in sorted_indices:
@@ -964,13 +1182,19 @@ class Denoiser(object):
         logger.debug("")
 
         output_stream = obspy.core.Stream()
-        for i in range(3):
-            for j in range(int(len(trimmed_streams) // 3)):
-                output_stream += trimmed_streams[3*j + i]
-        output_stream._cleanup()
+        # for i in range(3):
+        #     for j in range(int(len(trimmed_streams) // 3)):
+        #         output_stream += trimmed_streams[3*j + i]
         if not len(trimmed_streams):
             logger.debug("No events found")
             return
+
+        for comp in self.components:
+            for j in range(int(len(trimmed_streams) // 3)):
+                triple = trimmed_streams[3 * j: 3 * (j + 1)]
+                output_stream += triple.select(component=comp)[0]
+
+        output_stream._cleanup()
 
         # mask gap regions — zero out samples that fall within recorded gap intervals
         if gap_intervals:
@@ -999,59 +1223,684 @@ class Denoiser(object):
                             "_denoised.mseed",
                             format="MSEED", encoding="FLOAT32")
 
-    def _trim_streams(self, trimmed_streams, startstop):  # NEW
-        # NEW added len(startstop) == 0 or ==1 guard
+    def _trim_streams(self, trimmed_streams, startstop):
         logger.debug("")
         new_trimmed_stream = obspy.core.Stream()
 
         if len(startstop) == 0:
-            return new_trimmed_stream  # nothing to do
-
-        if len(startstop) == 1:
-            # single detection — no overlap possible, add directly
-            for j in range(3):
-                new_trimmed_stream += trimmed_streams[j]
             return new_trimmed_stream
 
-        buf = self.signal_buffer_s  # Added as variable
+        if len(startstop) == 1:
+            for comp in self.components:
+                new_trimmed_stream += trimmed_streams.select(component=comp)[0]
+            return new_trimmed_stream
+
+        buf = self.signal_buffer_s
         one_sample = self.one_sample_s
+
         for i in range(0, len(startstop) - 1):
-            if trimmed_streams[3 * i].stats.endtime < \
-                    trimmed_streams[3 * (i + 1)].stats.starttime:
-                for j in range(3):
-                    new_trimmed_stream += trimmed_streams[3 * i + j]
+            triple_i = trimmed_streams[3 * i:     3 * (i + 1)]
+            triple_next = trimmed_streams[3 * (i + 1): 3 * (i + 2)]
+
+            tr_i = triple_i.select(component=self.components[0])[0]
+            tr_next = triple_next.select(component=self.components[0])[0]
+
+            if tr_i.stats.endtime < tr_next.stats.starttime:
+                for comp in self.components:
+                    new_trimmed_stream += triple_i.select(component=comp)[0]
                 logger.debug("No overlap")
                 continue
 
-            if startstop[i][1] < trimmed_streams[3 * (i + 1)].stats.starttime:
+            if startstop[i][1] < tr_next.stats.starttime:
                 logger.debug("No signal overlap with next stream")
-                for j in range(3):
-                    new_trimmed_stream += trimmed_streams[3 * i + j].slice(
+                for comp in self.components:
+                    new_trimmed_stream += triple_i.select(component=comp)[0].slice(
                         endtime=startstop[i][1] - one_sample)
 
             elif startstop[i][1] + buf < startstop[i + 1][0]:
                 logger.debug("No signal overlap")
-                for j in range(3):
-                    new_trimmed_stream += trimmed_streams[3 * i + j].slice(
+                for comp in self.components:
+                    new_trimmed_stream += triple_i.select(component=comp)[0].slice(
                         endtime=startstop[i][1] - one_sample)
-                    trimmed_streams[3 * (i + 1) + j] = \
-                        trimmed_streams[3 * (i + 1) + j].slice(
-                            starttime=startstop[i + 1][0] - buf)
+                    # modify in place on the next triple
+                    tr_next = triple_next.select(component=comp)[0]
+                    tr_next = tr_next.slice(starttime=startstop[i + 1][0] - buf)
+                    trimmed_streams[3 * (i + 1) + self.components.index(comp)] = tr_next
             else:
                 logger.debug("Signal overlap")
-                for j in range(3):
-                    new_trimmed_stream += trimmed_streams[3 * i + j].slice(
+                for comp in self.components:
+                    new_trimmed_stream += triple_i.select(component=comp)[0].slice(
                         endtime=startstop[i + 1][0] - buf - one_sample)
-                    trimmed_streams[3 * (i + 1) + j] = \
-                        trimmed_streams[3 * (i + 1) + j].slice(
-                            starttime=startstop[i + 1][0] - buf)
+                    tr_next = triple_next.select(component=comp)[0]
+                    tr_next = tr_next.slice(starttime=startstop[i + 1][0] - buf)
+                    trimmed_streams[3 * (i + 1) + self.components.index(comp)] = tr_next
 
-        # add last segment — use explicit last index, not loop variable i
         last = len(startstop) - 1
-        for j in range(3):
-            new_trimmed_stream += trimmed_streams[3 * last + j]
+        triple_last = trimmed_streams[3 * last: 3 * (last + 1)]
+        for comp in self.components:
+            new_trimmed_stream += triple_last.select(component=comp)[0]
+
+        # for tr in new_trimmed_stream:
+        #     if tr.stats.starttime < data_start:
+        #         tr.trim(starttime=data_start, pad=True, fill_value=0)
+        #     if tr.stats.endtime > data_end:
+        #         tr.trim(endtime=data_end, pad=True, fill_value=0)
 
         return new_trimmed_stream
+
+    # def _filter_close_detections_streams(self, trimmed_streams, stream_start_end_final):
+    #     """
+    #     Remove detections whose signal start is closer than signal_buffer_s
+    #     to the previous detection. Operates on already-sorted trimmed_streams
+    #     and stream_start_end_final from _build_streams().
+    #     """
+    #     if len(stream_start_end_final) <= 1:
+    #         return trimmed_streams, stream_start_end_final
+    #
+    #     keep = [0]
+    #     for i in range(1, len(stream_start_end_final)):
+    #         sep = stream_start_end_final[i][0] - stream_start_end_final[keep[-1]][0]
+    #         if sep >= self.signal_buffer_s:
+    #             keep.append(i)
+    #         else:
+    #             logger.info(f"_filter_close_detections: dropping detection {keep[-1]} "
+    #                         f"(separation {sep:.2f}s < {self.signal_buffer_s}s), "
+    #                         f"keeping detection {i}")
+    #             keep[-1] = i
+    #
+    #     filtered_streams = obspy.core.Stream()
+    #     for i in keep:
+    #         filtered_streams += trimmed_streams[3 * i: 3 * (i + 1)]
+    #
+    #     filtered_startstop = [stream_start_end_final[i] for i in keep]
+    #     return filtered_streams, filtered_startstop
+    # =========================================================================
+    # NEW: Phase picking methods — integrated from DenoisingFunctions_public.py
+    # All methods prefixed with _ (private). Only _pick() and _save_picks()
+    # are called from run_data(); all others are internal helpers.
+    # =========================================================================
+
+    def _weighted_std(self, values, weights):
+        """
+        Compute the weighted standard deviation of an array.
+        Used by _tta_uncertainty() to quantify pick timing spread across TTA reps.
+
+        values  : 1D array-like
+        weights : 1D array-like, corresponding weights
+        Returns : float, weighted standard deviation
+        """
+        average = np.average(values, weights=weights + 1e-30)
+        variance = np.average((values - average) ** 2, weights=weights + 1e-30)
+        return np.sqrt(variance)
+
+
+    def _weighted_median(self, argmax_values, max_values):
+        """
+        Compute the weighted median of an array.
+        Used by _cluster_picks() to find the representative pick time per cluster.
+
+        argmax_values : 1D array-like, pick times
+        max_values    : 1D array-like, confidence weights
+        Returns       : float, weighted median pick time
+        """
+        argmax_values = np.asarray(argmax_values)
+        max_values = np.asarray(max_values)
+        sorted_indices = np.argsort(argmax_values)
+        sorted_vals = argmax_values[sorted_indices]
+        sorted_weights = max_values[sorted_indices]
+        cum_weights = np.cumsum(sorted_weights)
+        total_weight = np.sum(sorted_weights)
+        median_idx = np.searchsorted(cum_weights, total_weight / 2.0)
+        return sorted_vals[median_idx]
+
+
+    def _cluster_picks(self, pick_array, peak_vals, delta=1):
+        """
+        Cluster picks close in time and compute weighted median per cluster.
+        Used by _process_peak_times() to consolidate TTA picks into one per event.
+
+        pick_array : 1D numpy array, pick times in seconds relative to window start
+        peak_vals  : 1D numpy array, confidence values per pick
+        delta      : float, max separation (s) to consider picks the same cluster
+        Returns    : (medians, clusters)
+            medians  : list of weighted median times, one per cluster
+            clusters : list of lists of raw pick times per cluster
+        """
+        sorted_indices = np.argsort(pick_array)
+        sorted_picks = pick_array[sorted_indices]
+        diffs = np.diff(sorted_picks)
+        breaks = np.where(diffs > delta)[0] + 1
+        cluster_indices = np.split(sorted_indices, breaks)
+        medians = [self._weighted_median(pick_array[idx], peak_vals[idx])
+                   for idx in cluster_indices]
+        clusters = [[pick_array[i] for i in idx] for idx in cluster_indices]
+        return medians, clusters
+
+
+    def _tta_uncertainty(self, confidence_timeseries, pick_utc,
+                         pick_tolerance=1.0, confidence=0.5):
+        """
+        Estimate pick uncertainty from TTA confidence traces.
+        Used by _process_peak_times() per median pick.
+
+        confidence_timeseries : list of obspy.Trace, model confidence over time,
+                                one trace per TTA repetition
+        pick_utc              : UTCDateTime, pick time to evaluate around
+        pick_tolerance        : float, window half-width (s) around pick
+        confidence            : float, threshold for counting a trace as "above"
+        Returns               : (uncertainty, fraction_above_confidence)
+            uncertainty            : float, 1 + weighted std of argmax positions
+            fraction_above_confidence : float, fraction of TTA traces above threshold
+        """
+        t_start = pick_utc - pick_tolerance
+        t_end = pick_utc + pick_tolerance
+        sliced_traces = [
+            trace.slice(t_start, t_end)
+            for trace in confidence_timeseries
+            if trace.stats.starttime <= t_end and trace.stats.endtime >= t_start
+        ]
+        _argmax = [np.argmax(trace.data) for trace in sliced_traces]
+        _max = np.array([np.max(trace.data) for trace in sliced_traces])
+        reached_threshold = np.mean(_max > confidence)
+        return 1 + self._weighted_std(_argmax, _max), reached_threshold
+
+
+    def _process_peak_times(self, peak_times, peak_vals, annotations,
+                            channel_pattern, start_time,
+                            pick_tolerance=1, confidence=0.5):
+        """
+        Cluster TTA peak times, convert to UTC, compute uncertainty per pick.
+        Used by _process_snippet() separately for P and S phases.
+
+        peak_times      : 1D array, peak times relative to window start (s)
+        peak_vals       : 1D array, confidence values per peak
+        annotations     : obspy.Stream, model confidence traces (all TTA reps)
+        channel_pattern : str, e.g. "*_P" or "*_S" to select phase channel
+        start_time      : UTCDateTime, window start for converting to absolute UTC
+        pick_tolerance  : float, clustering tolerance (s)
+        confidence      : float, threshold for fraction_above_confidence
+        Returns         : (picks_median_utc, results)
+            picks_median_utc : list of UTCDateTime, one per cluster
+            results          : list of (uncertainty, fraction_above_confidence) tuples
+        """
+        if len(peak_times) == 0:
+            return [], []
+        picks_median, _ = self._cluster_picks(peak_times, peak_vals,
+                                              delta=pick_tolerance)
+        picks_median_utc = [start_time + t for t in picks_median]
+        selected_traces = annotations.select(channel=channel_pattern)
+        results = [
+            self._tta_uncertainty(selected_traces, pick,
+                                  pick_tolerance=1, confidence=confidence)
+            for pick in picks_median_utc
+        ]
+        return picks_median_utc, results
+
+
+    def _stream_tta(self, _event_stream, _noise_stream, id=0,
+                    white_noise_factor=0.01):
+        """
+        Apply one TTA augmentation by injecting amplitude-scaled white noise.
+        The noise amplitude envelope is derived from _noise_stream (designaled noise)
+        via std — white Gaussian noise is then scaled by that envelope.
+        Each id produces a different but fully reproducible noise realisation.
+
+        _event_stream     : obspy.Stream, denoised event waveforms (Z/N/E)
+        _noise_stream     : obspy.Stream, designaled noise for amplitude scaling
+        id                : int, TTA index — seeds the RNG for reproducibility
+        white_noise_factor: float, global scaling of injected noise amplitude
+        Returns           : obspy.Stream, augmented event stream
+        """
+        _event_noiseinjected = _event_stream.copy()
+        # seed by id — same id always produces same noise sequence
+        rng = np.random.default_rng(seed=id)
+        for comp in self.components:
+            tr_denoised = _event_noiseinjected.select(component=comp)[0]
+            tr_noise = _noise_stream.select(component=comp)[0]
+            tr_denoised.data += (white_noise_factor
+                                 * np.std(tr_noise.data)
+                                 * rng.standard_normal(len(tr_denoised.data)))
+            tr_denoised.stats.location = str(id).zfill(2)
+        return _event_noiseinjected
+
+
+    def _get_designaled_noise(self, _denoised_snippets, _original):
+        """
+        Compute per-snippet designaled noise = original - denoised.
+        Both inputs must be a single Z/N/E triple (exactly 1 trace per component).
+        Length alignment is the caller's responsibility (_pick() enforces this);
+        a last-resort truncation guard is included here.
+
+        _denoised_snippets : obspy.Stream, single denoised event snippet (3 traces)
+        _original          : obspy.Stream, original stream sliced to same window (3 traces)
+        Returns            : obspy.Stream, noise traces (3 components),
+                             or empty Stream on component/trace-count mismatch
+        """
+        missing_orig = [c for c in self.components if len(_original.select(component=c)) == 0]
+        missing_denoised = [c for c in self.components if len(_denoised_snippets.select(component=c)) == 0]
+        missing = missing_orig + missing_denoised
+
+
+        if missing:
+            logger.warning(f"_get_designaled_noise: missing components {missing} "
+                           f"(orig channels: {[tr.stats.channel for tr in _original]}, "
+                           f"self.components: {self.components}) — returning empty stream")
+            return obspy.core.Stream()
+
+        _noise = obspy.core.Stream()
+        for comp in self.components:
+            orig_comp = _original.select(component=comp)
+            denoised_comp = _denoised_snippets.select(component=comp)
+
+            # guard: exactly 1 trace per component expected (snippet, not continuous)
+            if len(orig_comp) != 1 or len(denoised_comp) != 1:
+                logger.warning(f"_get_designaled_noise: expected 1 trace per component, "
+                               f"got {len(orig_comp)} original and "
+                               f"{len(denoised_comp)} denoised for component {comp} "
+                               f"— merge inputs before calling")
+                return obspy.core.Stream()
+
+            tr_orig = orig_comp[0]
+            tr_denoised = denoised_comp[0]
+            n_orig = len(tr_orig.data)
+            n_denoised = len(tr_denoised.data)
+
+            if n_orig != n_denoised:
+                # last-resort truncation — caller should have aligned lengths
+                n = min(n_orig, n_denoised)
+                logger.warning(f"_get_designaled_noise: length mismatch on "
+                               f"component {comp} ({n_orig} vs {n_denoised}) "
+                               f"— truncating to {n} samples")
+                orig_data = tr_orig.data[:n]
+                denoised_data = tr_denoised.data[:n]
+            else:
+                orig_data = tr_orig.data
+                denoised_data = tr_denoised.data
+
+            noise_tr = tr_orig.copy()
+            noise_tr.data = (orig_data - denoised_data).astype(np.float32)
+            _noise += noise_tr
+
+
+        return _noise
+
+
+    # def _process_snippet(self, event_streams, st_designaled, repeat,
+    #                      pick_tolerance, p_confidence, s_confidence):
+    #     """
+    #     Run TTA phase picking on a single event Z/N/E triple.
+    #     Builds repeat augmented copies of the snippet with scaled white noise,
+    #     annotates them all in one batch, clusters picks, and computes uncertainty.
+    #
+    #     event_streams  : tuple of (tr_Z, tr_N, tr_E) obspy.Trace objects
+    #     st_designaled  : obspy.Stream, per-snippet noise for TTA amplitude scaling
+    #     repeat         : int, number of TTA augmentations
+    #     pick_tolerance : float, clustering tolerance in seconds
+    #     p_confidence   : float, min confidence for P picks
+    #     s_confidence   : float, min confidence for S picks
+    #     Returns        : dict with keys 'p_picks' and 's_picks', each a list of
+    #                      (median_utc, uncertainty, fraction_above_conf, event_id)
+    #     """
+    #     _st_z, _st_1, _st_2 = event_streams
+    #
+    #     # pad snippet slightly so picker has context around signal edges
+    #     add = 5 if _st_z.stats.npts >= 6120 else 5 + (6120 - _st_z.stats.npts) / 200
+    #     for st in (_st_z, _st_1, _st_2):
+    #         st.trim(st.stats.starttime - add, st.stats.endtime + add,
+    #                 pad=True, fill_value=0)
+    #
+    #     # _noise = st_designaled.copy()
+    #     _noise = obspy.core.Stream([
+    #         st_designaled.select(component=c)[0].copy()
+    #         for c in self.components
+    #     ])
+    #
+    #     _start, _end = _st_z.stats.starttime, _st_z.stats.endtime
+    #     for tr in _noise:
+    #         tr.trim(_start, _end, pad=True, fill_value=0)
+    #
+    #     # build TTA collection — repeat augmentations, each with different seed
+    #     event_tta_collection = Stream()
+    #     for i in range(repeat):
+    #         event_tta_collection += self._stream_tta(
+    #             Stream([_st_z, _st_1, _st_2]), _noise,
+    #             id=i, white_noise_factor=0.01)
+    #
+    #     annotations = self.picker.annotate(event_tta_collection, batch_size=repeat)
+    #     # sort by location (= zero-padded TTA id) for deterministic order
+    #     annotations.sort(keys=['location'])
+    #     annotations.trim(_start, _end, pad=True, fill_value=0)
+    #
+    #     picks_current_tta = self.picker.classify_aggregate(annotations, argdict={}).picks
+    #     p_picks_tta = picks_current_tta.select(min_confidence=p_confidence, phase="P")
+    #     s_picks_tta = picks_current_tta.select(min_confidence=s_confidence, phase="S")
+    #
+    #     p_peak_times = np.array([p.peak_time - _start for p in p_picks_tta])
+    #     s_peak_times = np.array([s.peak_time - _start for s in s_picks_tta])
+    #     p_peak_vals = np.array([p.peak_value for p in p_picks_tta])
+    #     s_peak_vals = np.array([s.peak_value for s in s_picks_tta])
+    #
+    #     p_picks_median, p_results = self._process_peak_times(
+    #         peak_times=p_peak_times, peak_vals=p_peak_vals,
+    #         annotations=annotations, channel_pattern="*_P",
+    #         start_time=_start, pick_tolerance=pick_tolerance,
+    #         confidence=p_confidence
+    #     )
+    #     s_picks_median, s_results = self._process_peak_times(
+    #         peak_times=s_peak_times, peak_vals=s_peak_vals,
+    #         annotations=annotations, channel_pattern="*_S",
+    #         start_time=_start, pick_tolerance=pick_tolerance,
+    #         confidence=s_confidence
+    #     )
+    #
+    #     event_id = _st_z.id
+    #     p_picks = [(m, r[0], r[1], event_id)
+    #                for m, r in zip(p_picks_median, p_results)]
+    #     s_picks = [(m, r[0], r[1], event_id)
+    #                for m, r in zip(s_picks_median, s_results)]
+    #     return {'p_picks': p_picks, 's_picks': s_picks}
+
+    def _process_snippet(self, event_streams, st_designaled, repeat,
+                         pick_tolerance, p_confidence, s_confidence):
+        """
+        Run TTA phase picking on a single event Z/N/E triple.
+        Builds repeat augmented copies of the snippet with scaled white noise,
+        annotates them all in one batch, clusters picks, and computes uncertainty.
+        Optionally runs polarity prediction on each accepted P pick using the
+        same TTA collection (no re-augmentation needed).
+
+        event_streams  : tuple of (tr_Z, tr_N, tr_E) obspy.Trace objects
+        st_designaled  : obspy.Stream, per-snippet noise for TTA amplitude scaling
+        repeat         : int, number of TTA augmentations
+        pick_tolerance : float, clustering tolerance in seconds
+        p_confidence   : float, min confidence for P picks
+        s_confidence   : float, min confidence for S picks
+        Returns        : dict with keys 'p_picks' and 's_picks', each a list of
+                         (median_utc, uncertainty, fraction_above_conf, event_id)
+                         **P picks additionally carry a polarity dict as fifth**
+                         **element when self.polarity_model is not None.**
+        """
+        _st_z, _st_1, _st_2 = event_streams
+
+        add = 5 if _st_z.stats.npts >= 6120 else 5 + (6120 - _st_z.stats.npts) / 200
+        for st in (_st_z, _st_1, _st_2):
+            st.trim(st.stats.starttime - add, st.stats.endtime + add,
+                    pad=True, fill_value=0)
+
+        _noise = obspy.core.Stream([
+            st_designaled.select(component=c)[0].copy()
+            for c in self.components
+        ])
+
+        _start, _end = _st_z.stats.starttime, _st_z.stats.endtime
+        for tr in _noise:
+            tr.trim(_start, _end, pad=True, fill_value=0)
+
+        event_tta_collection = Stream()
+        for i in range(repeat):
+            event_tta_collection += self._stream_tta(
+                Stream([_st_z, _st_1, _st_2]), _noise,
+                id=i, white_noise_factor=0.01)
+
+        annotations = self.picker.annotate(event_tta_collection, batch_size=repeat)
+        annotations.sort(keys=['location'])
+        annotations.trim(_start, _end, pad=True, fill_value=0)
+
+        picks_current_tta = self.picker.classify_aggregate(annotations, argdict={}).picks
+        p_picks_tta = picks_current_tta.select(min_confidence=p_confidence, phase="P")
+        s_picks_tta = picks_current_tta.select(min_confidence=s_confidence, phase="S")
+
+        p_peak_times = np.array([p.peak_time - _start for p in p_picks_tta])
+        s_peak_times = np.array([s.peak_time - _start for s in s_picks_tta])
+        p_peak_vals = np.array([p.peak_value for p in p_picks_tta])
+        s_peak_vals = np.array([s.peak_value for s in s_picks_tta])
+
+        p_picks_median, p_results = self._process_peak_times(
+            peak_times=p_peak_times, peak_vals=p_peak_vals,
+            annotations=annotations, channel_pattern="*_P",
+            start_time=_start, pick_tolerance=pick_tolerance,
+            confidence=p_confidence
+        )
+        s_picks_median, s_results = self._process_peak_times(
+            peak_times=s_peak_times, peak_vals=s_peak_vals,
+            annotations=annotations, channel_pattern="*_S",
+            start_time=_start, pick_tolerance=pick_tolerance,
+            confidence=s_confidence
+        )
+
+        event_id = _st_z.id
+
+        # **polarity — reuses event_tta_collection, no re-augmentation needed**
+        p_picks = []
+        for p_median, p_result in zip(p_picks_median, p_results):
+            entry = (p_median, p_result[0], p_result[1], event_id)
+            # **if polarity model configured on self, append polarity dict**
+            if self.polarity_model is not None:
+                polarity = _predict_polarity_tta(
+                    z_tta_collection=event_tta_collection,
+                    z_starttime=_st_z.stats.starttime,
+                    z_sampling_rate=_st_z.stats.sampling_rate,
+                    p_pick=p_median,
+                    polarity_model=self.polarity_model,
+                    threshold=self.polarity_threshold,
+                )
+                entry = entry + (polarity,)
+            p_picks.append(entry)
+
+        s_picks = [(m, r[0], r[1], event_id)
+                   for m, r in zip(s_picks_median, s_results)]
+
+        return {'p_picks': p_picks, 's_picks': s_picks}
+
+    def _process_picks(self, st_denoised, st_designaled,
+                       repeat=20, pick_tolerance=1,
+                       p_confidence=0.5, s_confidence=0.5,
+                       min_share_models=0.25):
+        """
+        Parallel TTA picking loop over all detected event snippets.
+        Processes each Z/N/E triple independently via ThreadPoolExecutor.
+        Results collected via as_completed(); pick order in output list is
+        non-deterministic but irrelevant since picks carry UTC time and event_id.
+
+        st_denoised      : obspy.Stream, denoised snippets (Z/N/E triples)
+        st_designaled    : obspy.Stream, per-snippet noise for TTA scaling,
+                           aligned to st_denoised (same number of triples)
+        repeat           : int, number of TTA augmentations per snippet
+        pick_tolerance   : float, clustering tolerance (s)
+        p_confidence     : float, min confidence for P picks
+        s_confidence     : float, min confidence for S picks
+        min_share_models : float, min fraction of TTA reps above threshold
+        Returns          : dict with keys 'p_picks' and 's_picks'
+        """
+        all_results = {'p_picks': [], 's_picks': []}
+
+        # sort both streams by starttime so Z/N/E triples zip correctly
+        st_denoised.sort(keys=['starttime'])
+        st_designaled.sort(keys=['starttime'])
+
+        # explicit component selection + sort ensures deterministic pairing
+        st_z_list = sorted(st_denoised.select(component=self.components[0]),
+                           key=lambda tr: tr.stats.starttime)
+        st_1_list = sorted(st_denoised.select(component=self.components[1]),
+                           key=lambda tr: tr.stats.starttime)
+        st_2_list = sorted(st_denoised.select(component=self.components[2]),
+                           key=lambda tr: tr.stats.starttime)
+
+        event_streams_list = list(zip(st_z_list, st_1_list, st_2_list))
+        designaled_streams_list = [st_designaled[3 * i: 3 * (i + 1)]
+                                   for i in range(len(event_streams_list))]
+
+        assert len(event_streams_list) == len(designaled_streams_list), (
+            f"Mismatch: {len(event_streams_list)} event streams vs "
+            f"{len(designaled_streams_list)} designaled streams"
+        )
+
+        with ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(
+                    self._process_snippet,
+                    event_streams,
+                    designaled_stream,
+                    repeat, pick_tolerance,
+                    p_confidence, s_confidence
+                )
+                # for event_streams in event_streams_list
+                for event_streams, designaled_stream in zip(event_streams_list, designaled_streams_list)
+            ]
+            # for future in futures:
+            for future in as_completed(futures):  # should be fine here
+                result = future.result()
+                all_results['p_picks'].extend(result['p_picks'])
+                all_results['s_picks'].extend(result['s_picks'])
+
+        # filter by minimum share of TTA models above confidence threshold
+        all_results['p_picks'] = [e for e in all_results['p_picks']
+                                   if e[2] > min_share_models]
+        all_results['s_picks'] = [e for e in all_results['s_picks']
+                                   if e[2] > min_share_models]
+        return all_results
+
+
+    def _pick(self, trimmed_streams, data_original):
+        """
+        Run phase picking on denoised event snippets using TTA.
+        Computes per-snippet designaled noise (original - denoised) to provide
+        the amplitude info for TTA white noise scaling. Memory cost scales
+        with number of detections x snippet length.
+
+        trimmed_streams : obspy.Stream
+            Denoised event snippets from _trim_streams(), Z/N/E per detection.
+            Picker runs on these only — never on continuous data.
+        data_original   : obspy.Stream
+            Original restituted full-day stream from _get_data().
+            Only in memory (not saved to disk). Used only to compute
+            per-snippet noise via (original - denoised).
+
+        Returns dict with keys 'p_picks' and 's_picks', each a list of tuples:
+            (median pick time, uncertainty, fraction above confidence, event_id)
+        """
+        # logger.debug(f"_pick: data_original has {len(data_original)} traces: "
+        #              f"{[tr.stats.channel for tr in data_original]}")
+
+        if not len(trimmed_streams):
+            logger.info("No denoised snippets — skipping picking")
+            return {'p_picks': [], 's_picks': []}
+
+        data_start = data_original[0].stats.starttime
+        data_end = data_original[0].stats.endtime
+
+        num_detections = len(trimmed_streams) // 3
+        st_designaled_snippets = obspy.core.Stream()
+
+        for i in range(num_detections):
+            snippet = trimmed_streams[3 * i: 3 * (i + 1)]
+            # logger.debug(f"Detection {i}: snippet components = "
+            #              f"{[tr.stats.channel for tr in snippet]}, "
+            #              f"npts = {[tr.stats.npts for tr in snippet]}")
+
+            tr_ref = snippet.select(component=self.components[0])[0]
+            if tr_ref.stats.npts == 0:  # TODO check why this happens
+                logger.warning(f"Detection {i}: zero-length snippet — skipping")
+                continue
+
+            # start = tr_ref.stats.starttime
+            # end = tr_ref.stats.endtime
+            start = max(tr_ref.stats.starttime, data_start)  # clamp
+            end = min(tr_ref.stats.endtime, data_end)  # clam
+            npts = tr_ref.stats.npts
+
+            # slice original to same window — tr.slice() avoids copying full day
+            original_snippet = obspy.core.Stream()
+
+            for tr in data_original:
+                tr_sliced = tr.slice(start, end)
+                # logger.debug(f"_pick slice: tr={tr.id} "
+                #              f"data={tr.stats.starttime}—{tr.stats.endtime} "
+                #              f"slice={start}—{end} "
+                #              f"result_npts={tr_sliced.stats.npts} "
+                #              f"expected_npts={npts}")
+
+                if tr_sliced.stats.npts != npts:
+                    tr_sliced = tr_sliced.trim(
+                        start,
+                        start + (npts - 1) * tr_sliced.stats.delta,
+                        nearest_sample=True, pad=True, fill_value=0
+                    )
+                original_snippet += tr_sliced
+
+            # logger.warning(f"snippet:{snippet[0].stats.starttime} — {snippet[0].stats.endtime}")
+            # logger.warning(f"original_snippet: {original_snippet[0].stats.starttime} — {original_snippet[0].stats.endtime}")
+
+            noise_snippet = self._get_designaled_noise(snippet, original_snippet)
+            if len(noise_snippet) == 0:
+                logger.warning(f"Detection {i}: _get_designaled_noise failed — "
+                               f"using zero noise for this snippet")
+                # zero-fill to preserve index alignment with trimmed_streams
+                for tr in snippet:
+                    zero_tr = tr.copy()
+                    zero_tr.data = np.zeros_like(tr.data)
+                    st_designaled_snippets += zero_tr
+            else:
+                st_designaled_snippets += noise_snippet
+
+        picks = self._process_picks(
+            st_denoised=trimmed_streams,
+            st_designaled=st_designaled_snippets,
+            **self.picking_kwargs
+        )
+        logger.info(f"Picks: {len(picks['p_picks'])} P, "
+                    f"{len(picks['s_picks'])} S")
+        return picks
+
+
+    def _save_picks(self, picks, starttime):
+        """
+        Save picks to JSON alongside MiniSEED output.
+        Format: {"p_picks": [{"time": ..., "uncertainty": ...,
+                               "share": ..., "id": ...,
+                               "polarity": ..., "polarity_probabilities": ...}, ...],
+                 "s_picks": [...]}
+
+        picks     : dict from _pick(), keys 'p_picks' and 's_picks'
+                    P pick tuples are (time, uncertainty, share, id) or
+                    (time, uncertainty, share, id, polarity_dict) when
+                    polarity model is configured.
+        starttime : UTCDateTime, used for output directory naming (same as _output)
+        """
+        dir_tmp = str(Path(self.model_name).parent /
+                      ("DOY" + str(starttime.julday).zfill(3))) + "/"
+        check_dir(dir_tmp)
+
+        serialisable = {}
+        for phase, pick_list in picks.items():
+            entries = []
+            for pick in pick_list:
+                t, u, s, eid = pick[:4]
+
+                # scale raw TTA std to physically meaningful seconds;
+                # coefficients derived from empirical calibration against reference picks
+                coeff = self.uncertainty_scaling[phase]
+                uncertainty_scaled = (coeff['scale_sample'] * u + coeff['offset_sample']) / self.stft_parameters["fs"]
+
+                entry = {"time": str(t), "uncertainty": uncertainty_scaled, "share": s, "id": eid}
+                # polarity dict present as fifth element for P picks
+                if len(pick) == 5:
+                    polarity = pick[4]
+                    entry["polarity"] = polarity["label"]
+                    entry["polarity_probabilities"] = polarity["probabilities"].tolist()
+                    # entry["polarity_all_predictions"] = polarity["all_predictions"].tolist()
+                entries.append(entry)
+            serialisable[phase] = entries
+
+        out_path = dir_tmp + f"picks_DOY{str(starttime.julday).zfill(3)}.json"
+        with open(out_path, "w") as f:
+            json.dump(serialisable, f, indent=2)
+        logger.info(f"Picks written to {out_path}")
+
+    # =========================================================================
+    # END picking methods
+    # =========================================================================
+
 
     def run_timerange(self, network, station, location, channel,
                       startday, endday):
@@ -1113,6 +1962,7 @@ class Denoiser(object):
         # OUT: endtime (UTCDateTime, adjusted so that endtime - starttime
         #               is an exact multiple of 61.2s, rounded up)
         endtime = self._round_to_window(starttime, endtime)
+
 
         # IN:  network, station, location, channel, starttime, endtime, data (optional raw Stream)
         # OUT: data (Stream, 3 components, restituted, 100 Hz, buffer trimmed),
@@ -1222,6 +2072,14 @@ class Denoiser(object):
                                 utc_start_subset, stream_start_end_final,
                                 data, denoised_hyb)
 
+        # SKIPPED remove detections too close together to be resolved by _trim_streams
+        # trimmed_streams, stream_start_end_final  = \
+        #     self._filter_close_detections_streams(trimmed_streams, stream_start_end_final)
+
+        if stft_final_subset.shape[0] == 0:
+            logger.info("No detections remaining after proximity filter")
+            return None
+
         # trimmed_streams = self._trim_streams(trimmed_streams, stream_start_end)  # OLD
         # IN:  trimmed_streams (obspy.Stream), stream_start_end_final (list, A)
         # OUT: trimmed_streams (obspy.Stream, overlap-trimmed)
@@ -1235,7 +2093,13 @@ class Denoiser(object):
         # OUT: writes denoised MiniSEED to disk with gap regions zeroed, returns nothing
         self._output(data[0].stats.starttime, trimmed_streams, gap_intervals)
 
-
+        # phase picking — optional, only if picker configured and snippets exist
+        # IN:  trimmed_streams (obspy.Stream, denoised snippets only),
+        #      data (obspy.Stream, original restituted, in memory only — not re-fetched)
+        # OUT: picks written to JSON on disk; MiniSEED already saved above as checkpoint
+        if self.picker is not None and len(trimmed_streams):
+            picks = self._pick(trimmed_streams, data)
+            self._save_picks(picks, data[0].stats.starttime)
 
 # %%
 if __name__ == "__main__":
@@ -1281,13 +2145,174 @@ if __name__ == "__main__":
     # )
     # %%
     from obspy import read
-    st = read("/home/niko/Earthquake-Seismogram-Denoiser/Models/DOY038/CH.DIX..HH_denoised.mseed")
+    st = read("/home/niko/Earthquake-Seismogram-Denoiser/Models/DOY038/CH.MFERR..HH_denoised.mseed")
     st.plot()
+    st.merge()
     # %%
     st.select(component="Z").plot(type="dayplot")
     # %%
     import matplotlib.pyplot as plt
-    plt.plot(st[0].data)
-    plt.xlim(1000,1150)
-    plt.ylim(-1e-9,1e-9)
+    plt.plot(st.select(component="Z")[0].data)
+    # plt.xlim(1090,1150)
+    plt.xlim(2617870,2617980)
+
+    # plt.ylim(-1e-9,1e-9)
     plt.show()
+    # %% With picker + polarity
+    from obspy import UTCDateTime
+    from obspy.clients.fdsn import Client
+    import sys
+    sys.path.append("/home/niko/Earthquake-Seismogram-Denoiser/Code")
+    from Denoiser_EQShyb import Denoiser
+
+    import seisbench.models as sbm
+
+    picker = sbm.EQTransformer.from_pretrained("ethz")
+
+    # clients
+    data_client     = Client("ETH")      # or "IRIS", "GFZ", SDS client, etc.
+    metadata_client = Client("ETH")      # fdsn client for response
+
+    denoiser = Denoiser(
+        data_client     = data_client,
+        metadata_client = metadata_client,
+        model_path      = "/home/niko/Earthquake-Seismogram-Denoiser/Models/model_1000k_onlyweights.keras",
+        min_peak_height = 0.33,
+        eqs2_model_path = "/home/niko/Earthquake-Seismogram-Denoiser/Models/EQS2.keras",  # optional, omit for EQS only
+        picker=picker,  # optional, omit to skip picking
+        picking_kwargs={
+            "repeat": 20,
+            "pick_tolerance": 1,
+            "p_confidence": 0.5,
+            "s_confidence": 0.5,
+            "min_share_models": 0.25
+        },
+        polarity_model_path="/home/niko/Schreibtisch/Polarity/Model/polarity_cnn_mixeddata_globalmaxavg_dropout02.keras",
+        polarity_kwargs={"threshold": 0.33},
+        debug=True
+    )
+
+    # ── single window ─────────────────────────────────────────────────────────
+    denoiser.run_data(
+        network   = "CH",
+        station   = "MFERR",
+        location  = "*",
+        channel   = "HH",
+        starttime = UTCDateTime("2025-02-07T05:00:00"),
+        endtime   = UTCDateTime("2025-02-08T05:00:00")
+    )
+# %%
+# import numpy as np
+# import tensorflow as tf
+#
+#
+#
+#
+# def trim_centered_1d(waveform, pick, win=256, pad_value=0.0):
+#     waveform = np.asarray(waveform)
+#     half = win // 2
+#
+#     out = np.full(win, pad_value, dtype=waveform.dtype)
+#
+#     if np.isfinite(pick):
+#         p = int(np.rint(pick))
+#         start = p - half
+#     else:
+#         start = 0
+#
+#     end = start + win
+#
+#     src0 = max(start, 0)
+#     src1 = min(end, waveform.shape[0])
+#
+#     dst0 = src0 - start
+#     dst1 = dst0 + (src1 - src0)
+#
+#     if src1 > src0:
+#         out[dst0:dst1] = waveform[src0:src1]
+#
+#     return out
+#
+# import numpy as np
+#
+# def predict_polarity_tta(
+#     stream,
+#     p_pick,
+#     polarity_model,
+#     target_noise_level,
+#     n_tta=20,
+#     threshold_polarity=None,
+#     rng=None,
+# ):
+#
+#     labels = np.array(["negative", "undecidable", "positive"])
+#     rng = np.random.default_rng() if rng is None else rng
+#
+#     tr_z = stream.select(component="Z")[0]
+#     z = tr_z.data
+#
+#     z = z.astype(np.float32)
+#     p_idx = int((p_pick-tr_z.stats.starttime) * tr_z.stats.sampling_rate)
+#
+#     # trim once
+#     z = trim_centered_1d(z, p_idx, win=256).astype(np.float32)
+#
+#     # TTA batch
+#     z_batch = np.repeat(z[None, :], n_tta, axis=0)
+#
+#     # noise
+#     scale = target_noise_level #* np.max(np.abs(z))
+#     z_batch += rng.standard_normal(z_batch.shape).astype(np.float32) * scale
+#
+#     plt.plot(z_batch[0])
+#     plt.title("noisy version (TTA sample 0)")
+#     plt.xlim(100,150)
+#     plt.show()
+#
+#     # normalize per sample
+#     z_batch /= np.maximum(np.max(np.abs(z_batch), axis=1, keepdims=True), 1e-20)
+#
+#     # predict
+#     pred = polarity_model(z_batch, training=True).numpy()
+#     mean_pred = pred.mean(axis=0)
+#
+#     label = labels[np.argmax(mean_pred)]
+#     if threshold_polarity is not None and mean_pred.max() < threshold_polarity:
+#         label = "undecidable"
+#
+#     return {
+#         "label": label,
+#         "probabilities": mean_pred,
+#         "all_predictions": pred,
+#     }
+#
+#
+# # ---------------------------------------------------------
+# # Load model
+# # ---------------------------------------------------------
+#
+# polarity_model = tf.keras.models.load_model(
+#     "/home/niko/Schreibtisch/Polarity/Model/polarity_cnn_mixeddata_globalmaxavg_dropout02.keras",
+#     compile=False,
+#     custom_objects={
+#         "custom>MaxAbsNorm1D": MaxAbsNorm1D
+#     },
+# )
+#
+# # ---------------------------------------------------------
+# # Example
+# # ---------------------------------------------------------
+#
+# result = predict_polarity_tta(
+#     stream=st.merge(),
+#     p_pick=UTCDateTime(2025, 2, 8, 0, 21, 34, 330000),
+#     # p_pick=UTCDateTime(2025, 2, 7, 17, 14, 40, 430000),
+#     polarity_model=polarity_model,
+#     target_noise_level=0.01*1e-9,
+#     n_tta=20,
+#     threshold_polarity=0.33,
+# )
+#
+# print(result["label"])
+# print(result["probabilities"])
+# # %%
