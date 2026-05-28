@@ -57,9 +57,6 @@ SENTINEL = object()
 #  |              └── _predict_polarity_tta()     ← optional, per accepted P pick; reuses TTA Z collection
 #  └── _save_picks()                    ← scale uncertainties, write picks JSON to disk (same DOY directory)
 
-# removed
-#  ├── _filter_close_detections_streams() ← drop detections too close to resolve in trimming
-
 
 def apply_pre_filt(data, samp_rate, pre_filt):
     """Apply ObsPy's remove_response pre_filt step (no response correction).
@@ -312,9 +309,6 @@ class Denoiser(object):
         self.REALIGN_SCORE_TOLERANCE = 0.5#1 # 0.5 # NEW added
         self.signal_buffer_s = 3.0  # buffer to start save denoised stream with at least 3s before signal start (ideally)
         self.one_sample_s = 1.0 / self.stft_parameters["fs"]  # = 0.01s at 100 Hz
-
-        # calibrated uncertainties
-        # timing_uncertainty_p =  (4 * 1.904 * initial_std_p + 9.249) / 100  timing_uncertainty_s =  (4 * 2.211 * initial_std_s + 3.6) / 100  # XXL low SNR
 
         # t = np.linspace(0, 61.2, 256)  # OLD
         # self.bin_spacing = (255/256) * (t[1]-t[0])  # OLD
@@ -824,13 +818,6 @@ class Denoiser(object):
                   data[0].stats.endtime - buffer)
         data.plot()
 
-        # components = [] # OLD
-        # for trace in data:
-        #     components.append(trace.stats.channel[-1])
-        # components.sort(reverse=True)
-        # data_stack = np.column_stack([data[0].data, # OLD
-        #                               data[1].data,
-        #                               data[2].data])
 
         self.components = sorted([tr.stats.channel[-1] for tr in data], reverse=True)  # NEW get components and fix order in data
 
@@ -998,11 +985,6 @@ class Denoiser(object):
                 logger.info("Not enough data, skipping")
                 stream_start_end.append(None)  # NEW maintain index alignment
                 continue
-            # OLD - returns data with expanded dim, expands dim again
-            # stft_tmp, stft_tmp_norm = self._process_segment(data_window)
-            # stft_collection_subset[i] = np.expand_dims(stft_tmp, axis=0)  # dim already added?
-            # stft_norm_collection_subset[i] = np.expand_dims(stft_tmp_norm, # dim already added?
-            #                                                 axis=0)
             # NEW
             stft_result, stft_norm_result = self._process_segment(data_window)
             stft_collection_subset[i] = stft_result  # remove the batch dim
@@ -1315,32 +1297,6 @@ class Denoiser(object):
 
         return new_trimmed_stream
 
-    # def _filter_close_detections_streams(self, trimmed_streams, stream_start_end_final):
-    #     """
-    #     Remove detections whose signal start is closer than signal_buffer_s
-    #     to the previous detection. Operates on already-sorted trimmed_streams
-    #     and stream_start_end_final from _build_streams().
-    #     """
-    #     if len(stream_start_end_final) <= 1:
-    #         return trimmed_streams, stream_start_end_final
-    #
-    #     keep = [0]
-    #     for i in range(1, len(stream_start_end_final)):
-    #         sep = stream_start_end_final[i][0] - stream_start_end_final[keep[-1]][0]
-    #         if sep >= self.signal_buffer_s:
-    #             keep.append(i)
-    #         else:
-    #             logger.info(f"_filter_close_detections: dropping detection {keep[-1]} "
-    #                         f"(separation {sep:.2f}s < {self.signal_buffer_s}s), "
-    #                         f"keeping detection {i}")
-    #             keep[-1] = i
-    #
-    #     filtered_streams = obspy.core.Stream()
-    #     for i in keep:
-    #         filtered_streams += trimmed_streams[3 * i: 3 * (i + 1)]
-    #
-    #     filtered_startstop = [stream_start_end_final[i] for i in keep]
-    #     return filtered_streams, filtered_startstop
     # =========================================================================
     # NEW: Phase picking methods — integrated from DenoisingFunctions_public.py
     # All methods prefixed with _ (private). Only _pick() and _save_picks()
@@ -1551,81 +1507,6 @@ class Denoiser(object):
 
         return _noise
 
-
-    # def _process_snippet(self, event_streams, st_designaled, repeat,
-    #                      pick_tolerance, p_confidence, s_confidence):
-    #     """
-    #     Run TTA phase picking on a single event Z/N/E triple.
-    #     Builds repeat augmented copies of the snippet with scaled white noise,
-    #     annotates them all in one batch, clusters picks, and computes uncertainty.
-    #
-    #     event_streams  : tuple of (tr_Z, tr_N, tr_E) obspy.Trace objects
-    #     st_designaled  : obspy.Stream, per-snippet noise for TTA amplitude scaling
-    #     repeat         : int, number of TTA augmentations
-    #     pick_tolerance : float, clustering tolerance in seconds
-    #     p_confidence   : float, min confidence for P picks
-    #     s_confidence   : float, min confidence for S picks
-    #     Returns        : dict with keys 'p_picks' and 's_picks', each a list of
-    #                      (median_utc, uncertainty, fraction_above_conf, event_id)
-    #     """
-    #     _st_z, _st_1, _st_2 = event_streams
-    #
-    #     # pad snippet slightly so picker has context around signal edges
-    #     add = 5 if _st_z.stats.npts >= 6120 else 5 + (6120 - _st_z.stats.npts) / 200
-    #     for st in (_st_z, _st_1, _st_2):
-    #         st.trim(st.stats.starttime - add, st.stats.endtime + add,
-    #                 pad=True, fill_value=0)
-    #
-    #     # _noise = st_designaled.copy()
-    #     _noise = obspy.core.Stream([
-    #         st_designaled.select(component=c)[0].copy()
-    #         for c in self.components
-    #     ])
-    #
-    #     _start, _end = _st_z.stats.starttime, _st_z.stats.endtime
-    #     for tr in _noise:
-    #         tr.trim(_start, _end, pad=True, fill_value=0)
-    #
-    #     # build TTA collection — repeat augmentations, each with different seed
-    #     event_tta_collection = Stream()
-    #     for i in range(repeat):
-    #         event_tta_collection += self._stream_tta(
-    #             Stream([_st_z, _st_1, _st_2]), _noise,
-    #             id=i, white_noise_factor=0.01)
-    #
-    #     annotations = self.picker.annotate(event_tta_collection, batch_size=repeat)
-    #     # sort by location (= zero-padded TTA id) for deterministic order
-    #     annotations.sort(keys=['location'])
-    #     annotations.trim(_start, _end, pad=True, fill_value=0)
-    #
-    #     picks_current_tta = self.picker.classify_aggregate(annotations, argdict={}).picks
-    #     p_picks_tta = picks_current_tta.select(min_confidence=p_confidence, phase="P")
-    #     s_picks_tta = picks_current_tta.select(min_confidence=s_confidence, phase="S")
-    #
-    #     p_peak_times = np.array([p.peak_time - _start for p in p_picks_tta])
-    #     s_peak_times = np.array([s.peak_time - _start for s in s_picks_tta])
-    #     p_peak_vals = np.array([p.peak_value for p in p_picks_tta])
-    #     s_peak_vals = np.array([s.peak_value for s in s_picks_tta])
-    #
-    #     p_picks_median, p_results = self._process_peak_times(
-    #         peak_times=p_peak_times, peak_vals=p_peak_vals,
-    #         annotations=annotations, channel_pattern="*_P",
-    #         start_time=_start, pick_tolerance=pick_tolerance,
-    #         confidence=p_confidence
-    #     )
-    #     s_picks_median, s_results = self._process_peak_times(
-    #         peak_times=s_peak_times, peak_vals=s_peak_vals,
-    #         annotations=annotations, channel_pattern="*_S",
-    #         start_time=_start, pick_tolerance=pick_tolerance,
-    #         confidence=s_confidence
-    #     )
-    #
-    #     event_id = _st_z.id
-    #     p_picks = [(m, r[0], r[1], event_id)
-    #                for m, r in zip(p_picks_median, p_results)]
-    #     s_picks = [(m, r[0], r[1], event_id)
-    #                for m, r in zip(s_picks_median, s_results)]
-    #     return {'p_picks': p_picks, 's_picks': s_picks}
 
     def _process_snippet(self, event_streams, st_designaled, repeat,
                          pick_tolerance, p_confidence, s_confidence):
@@ -2099,9 +1980,6 @@ class Denoiser(object):
                                 utc_start_subset, stream_start_end_final,
                                 data, denoised_hyb)
 
-        # SKIPPED remove detections too close together to be resolved by _trim_streams
-        # trimmed_streams, stream_start_end_final  = \
-        #     self._filter_close_detections_streams(trimmed_streams, stream_start_end_final)
 
         if stft_final_subset.shape[0] == 0:
             logger.info("No detections remaining after proximity filter")
