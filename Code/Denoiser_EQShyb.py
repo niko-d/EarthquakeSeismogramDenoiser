@@ -58,7 +58,7 @@ SENTINEL = object()
 #  └── _save_picks()                    ← scale uncertainties, write picks JSON to disk (same DOY directory)
 
 
-def apply_pre_filt(data, samp_rate, pre_filt):
+def apply_pre_filt(data, samp_rate, pre_filt,taper_seconds=300):
     """Apply ObsPy's remove_response pre_filt step (no response correction).
 
     Calls ObsPy functions directly. Reproduces the pre_filt block of
@@ -79,7 +79,9 @@ def apply_pre_filt(data, samp_rate, pre_filt):
     npts = len(data)
 
     data -= data.mean()
-    data *= cosine_taper(npts, p=0.05, sactaper=True, halfcosine=False)
+
+    p_fraction = (taper_seconds * samp_rate) / npts
+    data *= cosine_taper(npts, p=p_fraction, sactaper=True, halfcosine=False)
 
     nfft  = _npts2nfft(npts)
     spec  = np.fft.rfft(data, n=nfft)
@@ -87,10 +89,11 @@ def apply_pre_filt(data, samp_rate, pre_filt):
 
     spec *= cosine_sac_taper(freqs, flimit=pre_filt)
 
-    return np.fft.irfft(spec)[0:npts]
+    # return np.fft.irfft(spec)[0:npts]
+    return np.fft.irfft(spec,n=nfft)[0:npts]
 
 
-def apply_pre_filt_trace(trace, pre_filt):
+def apply_pre_filt_trace(trace, pre_filt,taper_seconds=300):
     """Apply pre_filt to a single ObsPy Trace, returns a new Trace.
 
     Parameters
@@ -103,11 +106,11 @@ def apply_pre_filt_trace(trace, pre_filt):
     obspy.Trace  Copy with pre-filtered data (float64).
     """
     out = trace.copy()
-    out.data = apply_pre_filt(trace.data, trace.stats.sampling_rate, pre_filt)
+    out.data = apply_pre_filt(trace.data, trace.stats.sampling_rate, pre_filt,taper_seconds=taper_seconds)
     return out
 
 
-def apply_pre_filt_stream(stream, pre_filt):
+def apply_pre_filt_stream(stream, pre_filt,taper_seconds=300):
     """Apply pre_filt to every trace in an ObsPy Stream, returns a new Stream.
 
     Parameters
@@ -119,7 +122,7 @@ def apply_pre_filt_stream(stream, pre_filt):
     -------
     obspy.Stream  New stream with pre-filtered traces (float64).
     """
-    return Stream([apply_pre_filt_trace(tr, pre_filt) for tr in stream])
+    return Stream([apply_pre_filt_trace(tr, pre_filt,taper_seconds=taper_seconds) for tr in stream])
 
 def _predict_polarity_tta(
     z_tta_collection,
@@ -802,7 +805,7 @@ class Denoiser(object):
                                       f"{channel}?", starttime, starttime)
 
         # apply filter as in obspy remove_response prefilter & remove any other AA filter
-        data = apply_pre_filt_stream(data, self.pre_filt)
+        data = apply_pre_filt_stream(data, self.pre_filt,taper_seconds=self.buffer)
 
         if data[0].stats.sampling_rate % 100 == 0:
             data.decimate(factor=int(data[0].stats.sampling_rate // 100),no_filter=True)
