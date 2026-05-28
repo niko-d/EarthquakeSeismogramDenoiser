@@ -40,6 +40,7 @@ SENTINEL = object()
 #  ├── _apply_eqshyb()                  ← optional, only if eqs2_model loaded and A > 0
 #  |    └── eqs2_model.predict()        ← hybrid time-domain refinement (inputs: noisy + EQS denoised + EQS mask)
 #  ├── _build_streams()                 ← ISTFT + stream assembly, EQS or EQShyb path; sorts by starttime
+#  ├── _filter_close_detections_streams() ← remove near-duplicate detections, keep higher-scoring
 #  ├── _trim_streams()                  ← resolve overlapping detections, apply signal buffer
 #  ├── _output()                        ← zero-fill gaps, write MiniSEED to disk
 #  ├── _pick()                          ← optional, only if picker configured and snippets exist
@@ -450,8 +451,6 @@ class Denoiser(object):
         key = inventory[0][0][0]
         npts = len(data[0].data)
 
-        logger.info(f"_get_response_parameters: dictkey npts={npts}, "
-                    f"cache keys={list(self.response_cache.keys())}")
 
         # we leave out channel code as the key, assuming that all channels have
         # the same response
@@ -479,9 +478,6 @@ class Denoiser(object):
         freq_response[1:] = 1.0 / freq_response[1:]
         self.response_cache[dictkey] = (taper_coeffs, freq_response, freqs,
                                         freq_domain_taper, nfft)
-
-        logger.debug(f"_get_response_parameters: npts={npts}, nfft={nfft}, "
-                     f"taper_coeffs shape will be={npts}")
 
         return (taper_coeffs, freq_response, freqs, freq_domain_taper, nfft)
 
@@ -666,7 +662,7 @@ class Denoiser(object):
                 window1_duration = end1 - start1
                 window2_duration = end2 - start2
                 smaller_window = min(window1_duration, window2_duration)
-                # Check if overlap is >90% of the smaller window
+                # Check if overlap is >X% of the smaller window
                 if overlap_duration > overlap * smaller_window:
                     # Compare scores
                     if score2 > score1:
@@ -723,7 +719,6 @@ class Denoiser(object):
 
     def get_peaks(self, timeseries, threshold=0.1, shift_correction=0):
         """
-        TODO- MAKE RIGHT INDEX SELECTION FOLLOW ORIGINAL LOGIC (first index from peak to rigth below threshold - not first from right window side..!!!)
         Detect peaks in a timeseries exceeding a given threshold
         and find their onset and end points.
 
@@ -1007,6 +1002,7 @@ class Denoiser(object):
         logger.debug("")
         stft_final_subset, masks_subset, utc_start_subset = [], [], []
         stream_start_end_final = []
+        scores_final = []  # NEW
         for i, y_event in enumerate(y_predict_event):
             _timeseries = (2 * np.max(y_event[:, :, 0], axis=0) +
                            np.max(y_event[:, :, 1], axis=0) +
@@ -1038,6 +1034,7 @@ class Denoiser(object):
                     stream_start_end_final.append((detection_start[i],
                                                    detection_start[i] +
                                                    detect_duration))
+                    scores_final.append(_score)
                 else:
                     stft_final_subset.append(stft_collection_subset[i])
                     masks_subset.append(y_event)
@@ -1048,16 +1045,16 @@ class Denoiser(object):
                                                    stream_start_end[i][0] +
                                                    _peak[0][2] *
                                                    self.bin_spacing])
-
+                    scores_final.append(_score)
         masks_subset = np.array(masks_subset)
         stft_final_subset = np.array(stft_final_subset)
 
         if stft_final_subset.shape[0] == 0:
             return (np.zeros((0, 64, 256, 6), dtype=np.float32),
                     np.zeros((0, 64, 256, 3), dtype=np.float32),
-                    [], [])
+                    [], [], [])  # NEW []
 
-        return stft_final_subset, masks_subset, utc_start_subset, stream_start_end_final
+        return stft_final_subset, masks_subset, utc_start_subset, stream_start_end_final, scores_final  # NEW
 
 
     def _build_streams(self, stft_final_subset, masks_subset, # NEW
@@ -1269,6 +1266,18 @@ class Denoiser(object):
             elif startstop[i][1] + buf < startstop[i + 1][0]:
                 logger.debug("No signal overlap")
                 for comp in self.components:
+                    ################
+                    slice_end = startstop[i][1] - one_sample
+                    # if triple_i.select(component=comp)[0].slice(endtime=slice_end).stats.npts == 0:
+                        # logger.warning(f"_trim_streams: zero-length slice at detection {i} "
+                        #                f"comp={comp}, "
+                        #                f"stream_start={triple_i.select(component=comp)[0].stats.starttime}, "
+                        #                f"stream_end={triple_i.select(component=comp)[0].stats.endtime}, "
+                        #                f"slice_end={slice_end}, "
+                        #                f"signal_start={startstop[i][0]}, signal_end={startstop[i][1]}, "
+                        #                f"next_signal_start={startstop[i+1][0]}, next_signal_end={startstop[i+1][1]}, ")
+
+                    ################
                     new_trimmed_stream += triple_i.select(component=comp)[0].slice(
                         endtime=startstop[i][1] - one_sample)
                     # modify in place on the next triple
@@ -1278,6 +1287,19 @@ class Denoiser(object):
             else:
                 logger.debug("Signal overlap")
                 for comp in self.components:
+                    ################
+                    slice_end = startstop[i + 1][0] - buf - one_sample
+                    # if triple_i.select(component=comp)[0].slice(endtime=slice_end).stats.npts == 0:
+                    #     logger.warning(f"_trim_streams: zero-length slice at detection {i} "
+                    #                    f"comp={comp}, "
+                    #                    f"stream_start={triple_i.select(component=comp)[0].stats.starttime}, "
+                    #                    f"stream_end={triple_i.select(component=comp)[0].stats.endtime}, "
+                    #                    f"slice_end={slice_end}, "
+                    #                    f"signal_start={startstop[i][0]}, signal_end={startstop[i][1]}, "
+                    #                    f"next_signal_start={startstop[i+1][0]}, next_signal_end={startstop[i+1][1]}, ")
+
+
+                    ######################
                     new_trimmed_stream += triple_i.select(component=comp)[0].slice(
                         endtime=startstop[i + 1][0] - buf - one_sample)
                     tr_next = triple_next.select(component=comp)[0]
@@ -1296,6 +1318,40 @@ class Denoiser(object):
         #         tr.trim(endtime=data_end, pad=True, fill_value=0)
 
         return new_trimmed_stream
+
+
+    def _filter_close_detections_streams(self, trimmed_streams, stream_start_end_final, scores_final):
+        """
+        Remove detections whose signal start is closer than signal_buffer_s
+        to the previous detection, keeping the higher-scoring one.
+        Operates on already-sorted trimmed_streams and stream_start_end_final
+        from _build_streams().
+        """
+        if len(stream_start_end_final) <= 1:
+            return trimmed_streams, stream_start_end_final
+
+        keep = [0]
+        for i in range(1, len(stream_start_end_final)):
+            sep = stream_start_end_final[i][0] - stream_start_end_final[keep[-1]][0]
+            if sep >= self.signal_buffer_s:
+                keep.append(i)
+            else:
+                if scores_final[i] > scores_final[keep[-1]]:
+                    logger.info(f"_filter_close_detections: dropping detection {keep[-1]} "
+                                f"(score {scores_final[keep[-1]]:.2f} < {scores_final[i]:.2f}, "
+                                f"separation {sep:.2f}s), keeping detection {i}")
+                    keep[-1] = i
+                else:
+                    logger.info(f"_filter_close_detections: dropping detection {i} "
+                                f"(score {scores_final[i]:.2f} <= {scores_final[keep[-1]]:.2f}, "
+                                f"separation {sep:.2f}s), keeping detection {keep[-1]}")
+
+        filtered_streams = obspy.core.Stream()
+        for i in keep:
+            filtered_streams += trimmed_streams[3 * i: 3 * (i + 1)]
+
+        filtered_startstop = [stream_start_end_final[i] for i in keep]
+        return filtered_streams, filtered_startstop
 
     # =========================================================================
     # NEW: Phase picking methods — integrated from DenoisingFunctions_public.py
@@ -1949,8 +2005,9 @@ class Denoiser(object):
         #      utc_start_subset (list of UTCDateTime, A, window start accepted detections),
         #      stream_start_end_final (list of (UTCDateTime, UTCDateTime), A,
         #                              signal start/end per accepted detection)
+        #      scores_final (list of float, A, detection score per accepted detection)
         #      A = number of accepted detections (<= D)
-        stft_final_subset, masks_subset, utc_start_subset, stream_start_end_final = \
+        stft_final_subset, masks_subset, utc_start_subset, stream_start_end_final, scores_final = \
             self._make_final_selection(y_predict_event, filtered_results,
                                        detection_start, selected_stft,
                                        selected_masks, selected_utc,
@@ -1981,7 +2038,16 @@ class Denoiser(object):
                                 data, denoised_hyb)
 
 
-        if stft_final_subset.shape[0] == 0:
+        # remove detections too close together to be resolved by _trim_streams
+        # IN:  trimmed_streams (obspy.Stream, sorted denoised traces),
+        #      stream_start_end_final (list of (UTCDateTime, UTCDateTime), A, sorted),
+        #      scores_final (list of float, A, detection score per accepted detection)
+        # OUT: trimmed_streams (obspy.Stream, duplicates removed, higher-scoring kept),
+        #      stream_start_end_final (list of (UTCDateTime, UTCDateTime), filtered)
+        trimmed_streams, stream_start_end_final  = \
+            self._filter_close_detections_streams(trimmed_streams, stream_start_end_final, scores_final)
+
+        if len(stream_start_end_final) == 0:
             logger.info("No detections remaining after proximity filter")
             return None
 
@@ -2047,10 +2113,38 @@ if __name__ == "__main__":
     # ── single window ─────────────────────────────────────────────────────────
     denoiser.run_data(
         network   = "CH",
-        station   = "MFERR",
+        station   = "SEMOS",
         location  = "*",
-        channel   = "HH",
+        channel   = "HG",
         starttime = UTCDateTime("2025-02-07T17:00:00"),
         endtime   = UTCDateTime("2025-02-08T17:00:00")
     )
+# %%
+from obspy import read
+st = read("/home/niko/Earthquake-Seismogram-Denoiser/Models/DOY038/CH.SEMOS..HG_denoised.mseed")
+st.plot()
+# st = st.select(component="Z").merge().trim(starttime,endtime, fill_value=0, pad=True)
+# st.plot(type="dayplot",interval=1,vertical_scaling_range=10000)
+# %%
+#
+import json
+import matplotlib.pyplot as plt
+from obspy import UTCDateTime
 
+with open("/home/niko/Earthquake-Seismogram-Denoiser/Models/DOY038/picks_DOY038.json") as f:
+    picks = json.load(f)
+
+p_times = [UTCDateTime(p["time"]) for p in picks["p_picks"]]
+s_times = [UTCDateTime(s["time"]) for s in picks["s_picks"]]
+
+fig, ax = plt.subplots(figsize=(14, 3))
+ax.vlines([t.matplotlib_date for t in p_times], 0, 1, color="red",   label=f"P ({len(p_times)})")
+ax.vlines([t.matplotlib_date for t in s_times], 0, 1, color="blue",  label=f"S ({len(s_times)})")
+ax.xaxis_date()
+fig.autofmt_xdate()
+ax.set_xlabel("Time")
+ax.set_yticks([])
+ax.legend()
+ax.set_title("Picks DOY038")
+plt.tight_layout()
+plt.show()
