@@ -813,13 +813,10 @@ class Denoiser(object):
             # data.filter("lowpass", freq=45.0, corners=8, zerophase=False)  # NEW - add filter ???
             data.resample(100,no_filter=True) # no filter default, additioonal AA off by frequency taper
 
-        data.plot()
         self._fast_remove_response(data, metadata)
-        data.plot()
 
         data.trim(data[0].stats.starttime + buffer,
                   data[0].stats.endtime - buffer)
-        data.plot()
 
 
         self.components = sorted([tr.stats.channel[-1] for tr in data], reverse=True)  # NEW get components and fix order in data
