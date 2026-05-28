@@ -302,7 +302,7 @@ class Denoiser(object):
         self.data_client = data_client
         self.metadata_client = metadata_client
         self.threshold = 10
-        self.buffer = 600
+        self.buffer = 300
         self.len_sample = 6120
         self.shift_samples = int(self.len_sample / 2)
         self.bins_overlap = 128
@@ -453,6 +453,9 @@ class Denoiser(object):
         key = inventory[0][0][0]
         npts = len(data[0].data)
 
+        logger.info(f"_get_response_parameters: dictkey npts={npts}, "
+                    f"cache keys={list(self.response_cache.keys())}")
+
         # we leave out channel code as the key, assuming that all channels have
         # the same response
         dictkey = (network, station, key.location_code, str(key.start_date),
@@ -464,8 +467,12 @@ class Denoiser(object):
         logger.debug("Cache miss")
 
         response = data[0]._get_response(inventory)
-        taper_coeffs = cosine_taper(npts, 0.05,
+        # taper length fraction
+        p_fraction = (self.buffer * data[0].stats.sampling_rate) / npts
+
+        taper_coeffs = cosine_taper(npts, p_fraction,
                                     sactaper=True, halfcosine=False)
+
         nfft = _npts2nfft(npts)
         freq_response, freqs = \
             response.get_evalresp_response(data[0].stats.delta, nfft,
@@ -475,6 +482,10 @@ class Denoiser(object):
         freq_response[1:] = 1.0 / freq_response[1:]
         self.response_cache[dictkey] = (taper_coeffs, freq_response, freqs,
                                         freq_domain_taper, nfft)
+
+        logger.debug(f"_get_response_parameters: npts={npts}, nfft={nfft}, "
+                     f"taper_coeffs shape will be={npts}")
+
         return (taper_coeffs, freq_response, freqs, freq_domain_taper, nfft)
 
     def _fast_remove_response(self, data, inventory):
@@ -499,18 +510,20 @@ class Denoiser(object):
         """
 
         npts = len(data[0].data)
+
         taper_coeffs, freq_response, freqs, freq_domain_taper, nfft \
             = self._get_response_parameters(data, inventory)
 
         for trace in data:
-            channel = trace.data
-            channel = channel.astype(np.float32)
+            channel = trace.data.astype(np.float32)
             channel -= channel.mean()
             channel *= taper_coeffs
             spec = np.fft.rfft(channel, n=nfft)
             spec *= freq_domain_taper
             spec *= freq_response
-            trace.data = np.fft.irfft(spec, n=npts)
+            # trace.data = np.fft.irfft(spec, n=npts)  # OLD
+            trace.data = np.fft.irfft(spec, n=nfft)[:npts]  # NEW
+
         return
 
     # def stft_gpu(self, signal_np, fs=100, nperseg=48, noverlap=24,
@@ -704,14 +717,16 @@ class Denoiser(object):
                             np.max(mask_array[:, :, :, 1], axis=1) +
                             np.max(mask_array[:, :, :, 2], axis=1)) / 4
 
-        # timeseries_3comp.shape[0] # removed OLD
         # step through overlapping array
         array_even = timeseries_3comp[0::2].reshape(-1)
         array_odd = timeseries_3comp[1::2].reshape(-1)
         return array_even, array_odd
 
+
+
     def get_peaks(self, timeseries, threshold=0.1, shift_correction=0):
         """
+        TODO- MAKE RIGHT INDEX SELECTION FOLLOW ORIGINAL LOGIC (first index from peak to rigth below threshold - not first from right window side..!!!)
         Detect peaks in a timeseries exceeding a given threshold
         and find their onset and end points.
 
@@ -776,6 +791,7 @@ class Denoiser(object):
                                                   location, f"{channel}?",
                                                   starttime - buffer,
                                                   endtime + buffer)
+
         # NEW collect gaps
         gap_list = data.get_gaps()
         gap_intervals = [(g[4], g[5]) for g in gap_list]
@@ -792,23 +808,21 @@ class Denoiser(object):
                                       f"{channel}?", starttime, starttime)
 
         # apply filter as in obspy remove_response prefilter & remove any other AA filter
-        ...
         data = apply_pre_filt_stream(data, self.pre_filt)
+
         if data[0].stats.sampling_rate % 100 == 0:
-            # data.filter("lowpass", freq=45.0, corners=4, zerophase=True)  # OLD
-            # data.filter("lowpass", freq=45.0, corners=8, zerophase=False)  # NEW
-            # OR decimate anti aliasing filter, similar to tr.filter('lowpass_cheby_2', freq=45.0, maxorder=12)
-            # freq = self.stats.sampling_rate * 0.5 / float(factor)
-            # self.filter('lowpass_cheby_2', freq=freq, maxorder=12) ???
-            data.decimate(factor=int(data[0].stats.sampling_rate // 100),
-                          no_filter=False)
+            data.decimate(factor=int(data[0].stats.sampling_rate // 100),no_filter=True)
         else:
             # data.filter("lowpass", freq=45.0, corners=8, zerophase=False)  # NEW - add filter ???
             data.resample(100,no_filter=True) # no filter default, additioonal AA off by frequency taper
 
+        data.plot()
         self._fast_remove_response(data, metadata)
+        data.plot()
+
         data.trim(data[0].stats.starttime + buffer,
                   data[0].stats.endtime - buffer)
+        data.plot()
 
         # components = [] # OLD
         # for trace in data:
@@ -819,12 +833,24 @@ class Denoiser(object):
         #                               data[2].data])
 
         self.components = sorted([tr.stats.channel[-1] for tr in data], reverse=True)  # NEW get components and fix order in data
+
+
         # z comp first, other componets abitrarily
         data_stack = np.column_stack([
             data.select(component=self.components[0])[0].data,
             data.select(component=self.components[1])[0].data,
             data.select(component=self.components[2])[0].data
         ])
+
+        logger.info(f"data_stack columns (components={self.components}): "
+                    f"col0_std={data_stack[:, 0].std():.12f}, "
+                    f"col1_std={data_stack[:, 1].std():.12f}, "
+                    f"col2_std={data_stack[:, 2].std():.12f}, "
+                    f"col0_shape={np.shape(data_stack[:, 0])}, "
+                    f"col1_shape={np.shape(data_stack[:, 1])}, "
+                    f"col2_shape={np.shape(data_stack[:, 2])}, "
+                    f"col0_second_half_std={data_stack[data_stack.shape[0] // 2:, 0].std():.12f}, "
+                    f"col0_second_half_max={np.abs(data_stack[data_stack.shape[0] // 2:, 0]).max():.12f}")
 
         # return (data, data_stack)  # OLD
         return (data, data_stack, gap_intervals)  # NEW
@@ -873,14 +899,12 @@ class Denoiser(object):
         logger.debug("")
         model_verbose = 0
 
-        y_predict = self.model.predict(stft_norm_collection,
+        y_predict = self.model.predict(stft_norm_collection.astype(np.float32),
                                        verbose=model_verbose)
+
+
         mask_timeseries_even, mask_timeseries_odd = \
             self._get_mask_timeseries(y_predict)
-
-        mid = len(mask_timeseries_even) // 2
-        logger.info(f"mask timeseries even: first half max={mask_timeseries_even[:mid].max():.3f}, "
-                    f"second half max={mask_timeseries_even[mid:].max():.3f}")
 
         # get peaks with start and end, with fixed min. threshold
         #  for max of time series (=at leats one bin with mask value>0.1)
@@ -892,6 +916,9 @@ class Denoiser(object):
         peak_info_odd = self.get_peaks(mask_timeseries_odd,
                                        threshold=self.min_peak_height,
                                        shift_correction=0)
+
+
+
         filtered_results, origin = \
             self._compare_arrays_time_overlap(peak_info_even, peak_info_odd)
 
@@ -2103,61 +2130,7 @@ class Denoiser(object):
 
 # %%
 if __name__ == "__main__":
-    from obspy import UTCDateTime
-    from obspy.clients.fdsn import Client
-    import sys
-    sys.path.append("/home/niko/Earthquake-Seismogram-Denoiser/Code")
 
-    from Denoiser_EQShyb import Denoiser
-
-    # clients
-    data_client     = Client("ETH")      # or "IRIS", "GFZ", SDS client, etc.
-    metadata_client = Client("ETH")      # fdsn client for response
-
-    # instantiate
-    denoiser = Denoiser(
-        data_client     = data_client,
-        metadata_client = metadata_client,
-        model_path      = "/home/niko/Earthquake-Seismogram-Denoiser/Models/model_1000k_onlyweights.keras",
-        min_peak_height = 0.33,
-        eqs2_model_path = "/home/niko/Earthquake-Seismogram-Denoiser/Models/EQS2.keras",  # optional, omit for EQS only
-        debug           = True                       # False for production
-    )
-
-    # ── single window ─────────────────────────────────────────────────────────
-    denoiser.run_data(
-        network   = "CH",
-        station   = "DIX",
-        location  = "*",
-        channel   = "HH",
-        starttime = UTCDateTime("2025-02-07T17:00:00"),
-        endtime   = UTCDateTime("2025-02-08T17:00:00")
-    )
-
-    # # ── multi-day ─────────────────────────────────────────────────────────────
-    # denoiser.run_timerange(
-    #     network  = "CH",
-    #     station  = "DIX",
-    #     location = "*",
-    #     channel  = "HH",
-    #     startday = UTCDateTime("2023-01-15"),
-    #     endday   = UTCDateTime("2023-01-17")   # inclusive
-    # )
-    # %%
-    from obspy import read
-    st = read("/home/niko/Earthquake-Seismogram-Denoiser/Models/DOY038/CH.MFERR..HH_denoised.mseed")
-    st.plot()
-    st.merge()
-    # %%
-    st.select(component="Z").plot(type="dayplot")
-    # %%
-    import matplotlib.pyplot as plt
-    plt.plot(st.select(component="Z")[0].data)
-    # plt.xlim(1090,1150)
-    plt.xlim(2617870,2617980)
-
-    # plt.ylim(-1e-9,1e-9)
-    plt.show()
     # %% With picker + polarity
     from obspy import UTCDateTime
     from obspy.clients.fdsn import Client
@@ -2188,6 +2161,7 @@ if __name__ == "__main__":
             "min_share_models": 0.25
         },
         polarity_model_path="/home/niko/Schreibtisch/Polarity/Model/polarity_cnn_mixeddata_globalmaxavg_dropout02.keras",
+
         polarity_kwargs={"threshold": 0.33},
         debug=True
     )
@@ -2198,121 +2172,7 @@ if __name__ == "__main__":
         station   = "MFERR",
         location  = "*",
         channel   = "HH",
-        starttime = UTCDateTime("2025-02-07T05:00:00"),
-        endtime   = UTCDateTime("2025-02-08T05:00:00")
+        starttime = UTCDateTime("2025-02-07T17:00:00"),
+        endtime   = UTCDateTime("2025-02-08T17:00:00")
     )
-# %%
-# import numpy as np
-# import tensorflow as tf
-#
-#
-#
-#
-# def trim_centered_1d(waveform, pick, win=256, pad_value=0.0):
-#     waveform = np.asarray(waveform)
-#     half = win // 2
-#
-#     out = np.full(win, pad_value, dtype=waveform.dtype)
-#
-#     if np.isfinite(pick):
-#         p = int(np.rint(pick))
-#         start = p - half
-#     else:
-#         start = 0
-#
-#     end = start + win
-#
-#     src0 = max(start, 0)
-#     src1 = min(end, waveform.shape[0])
-#
-#     dst0 = src0 - start
-#     dst1 = dst0 + (src1 - src0)
-#
-#     if src1 > src0:
-#         out[dst0:dst1] = waveform[src0:src1]
-#
-#     return out
-#
-# import numpy as np
-#
-# def predict_polarity_tta(
-#     stream,
-#     p_pick,
-#     polarity_model,
-#     target_noise_level,
-#     n_tta=20,
-#     threshold_polarity=None,
-#     rng=None,
-# ):
-#
-#     labels = np.array(["negative", "undecidable", "positive"])
-#     rng = np.random.default_rng() if rng is None else rng
-#
-#     tr_z = stream.select(component="Z")[0]
-#     z = tr_z.data
-#
-#     z = z.astype(np.float32)
-#     p_idx = int((p_pick-tr_z.stats.starttime) * tr_z.stats.sampling_rate)
-#
-#     # trim once
-#     z = trim_centered_1d(z, p_idx, win=256).astype(np.float32)
-#
-#     # TTA batch
-#     z_batch = np.repeat(z[None, :], n_tta, axis=0)
-#
-#     # noise
-#     scale = target_noise_level #* np.max(np.abs(z))
-#     z_batch += rng.standard_normal(z_batch.shape).astype(np.float32) * scale
-#
-#     plt.plot(z_batch[0])
-#     plt.title("noisy version (TTA sample 0)")
-#     plt.xlim(100,150)
-#     plt.show()
-#
-#     # normalize per sample
-#     z_batch /= np.maximum(np.max(np.abs(z_batch), axis=1, keepdims=True), 1e-20)
-#
-#     # predict
-#     pred = polarity_model(z_batch, training=True).numpy()
-#     mean_pred = pred.mean(axis=0)
-#
-#     label = labels[np.argmax(mean_pred)]
-#     if threshold_polarity is not None and mean_pred.max() < threshold_polarity:
-#         label = "undecidable"
-#
-#     return {
-#         "label": label,
-#         "probabilities": mean_pred,
-#         "all_predictions": pred,
-#     }
-#
-#
-# # ---------------------------------------------------------
-# # Load model
-# # ---------------------------------------------------------
-#
-# polarity_model = tf.keras.models.load_model(
-#     "/home/niko/Schreibtisch/Polarity/Model/polarity_cnn_mixeddata_globalmaxavg_dropout02.keras",
-#     compile=False,
-#     custom_objects={
-#         "custom>MaxAbsNorm1D": MaxAbsNorm1D
-#     },
-# )
-#
-# # ---------------------------------------------------------
-# # Example
-# # ---------------------------------------------------------
-#
-# result = predict_polarity_tta(
-#     stream=st.merge(),
-#     p_pick=UTCDateTime(2025, 2, 8, 0, 21, 34, 330000),
-#     # p_pick=UTCDateTime(2025, 2, 7, 17, 14, 40, 430000),
-#     polarity_model=polarity_model,
-#     target_noise_level=0.01*1e-9,
-#     n_tta=20,
-#     threshold_polarity=0.33,
-# )
-#
-# print(result["label"])
-# print(result["probabilities"])
-# # %%
+
