@@ -16,7 +16,6 @@ from DenoisingFunctions_public import check_dir, normalize_percentile
 from scipy.signal import find_peaks
 from pathlib import Path
 from scipy.signal import istft
-from obspy.signal.invsim import cosine_taper, cosine_sac_taper
 from obspy.signal.util import _npts2nfft
 from obspy import Stream, Trace  # NEW: used in _stream_tta()
 from concurrent.futures import ThreadPoolExecutor, as_completed  # NEW: used in _process_picks()
@@ -26,38 +25,78 @@ _PROGRAM_START = time.perf_counter()
 logger = logging.getLogger(__name__)
 
 SENTINEL = object()
-
-
-# run_data()
+# ─── Module-level definitions ─────────────────────────────────────────────────
+#
+#  Functions (module-level):
+#    apply_pre_filt()          ← zero-mean, cosine taper, FFT, cosine_sac_taper, IFFT
+#    apply_pre_filt_trace()    ← apply pre-filter to a single trace
+#    apply_pre_filt_stream()   ← apply pre-filter to all traces in a stream
+#    _predict_polarity_tta()   ← TTA polarity prediction on Z component batch
+#    setup_logging()           ← configure relative-time logging handler
+#
+#  Classes (module-level):
+#    Pick                      ← dataclass: accepted phase pick (time, uncertainty,
+#                                           share, event_id, polarity)
+#    MaxAbsNorm1D              ← Keras layer: per-channel max-abs normalisation
+#                                (used by polarity model)
+#    ReflectPad1D              ← Keras layer: reflect padding 1D
+#                                (used by EQShyb model)
+#    RelativeTimeFormatter     ← logging.Formatter subclass: elapsed-time prefix
+#    Denoiser                  ← main class, see call trees below
+#
+# ─── Denoiser call trees ──────────────────────────────────────────────────────
+#
+# run_timerange()                        ← multi-day entry point; producer-consumer pipeline
+#  ├── _loader_thread()                  ← producer: fetch one day per iteration, push to queue
+#  |    └── _round_to_window()          ← snap day end to exact multiple of 61.2 s
+#  └── _consumer_thread()               ← consumer: drain queue, call run_data() per day
+#       └── run_data()                  ← see below
+#
+# run_data()                             ← single-window entry point
 #  ├── _round_to_window()               ← snap endtime to exact multiple of 61.2 s
-#  ├── _get_data()                      ← fetch, resample, remove response, gap detection
-#  ├── _compute_stfts()                 ← sliding window STFT over full day
+#  ├── _get_data()                      ← fetch, gap detection, resample, remove response
+#  |    ├── _get_metadata()            ← load inventory via _query_server (cached)
+#  |    |    └── _query_server()       ← FDSN inventory fetch, cached per network/station
+#  |    ├── apply_pre_filt_stream()    ← apply cosine taper + freq-domain pre-filter to all traces
+#  |    |    └── apply_pre_filt_trace() ← apply pre-filter to a single trace
+#  |    |         └── apply_pre_filt() ← zero-mean, cosine taper, FFT, cosine_sac_taper, IFFT
+#  |    └── _fast_remove_response()    ← cached inverse response, FFT-based correction
+#  |         └── _get_response_parameters() ← compute/cache taper + freq response per npts
+#  ├── _compute_stfts()                 ← sliding window STFT over full time range
+#  |    └── _process_segment()         ← STFT for one 61.2 s window, returns raw + normalised
+#  |         └── normalize_percentile() ← percentile normalisation (DenoisingFunctions_public)
 #  ├── _detect_event_signals()          ← EQS first pass, peak detection on mask timeseries
+#  |    ├── model.predict()            ← EQS mask prediction on all windows
+#  |    ├── _get_mask_timeseries()     ← collapse mask array to even/odd timeseries
+#  |    ├── get_peaks()                ← find peaks with onset/end boundaries (×2: even, odd)
+#  |    └── _compare_arrays_time_overlap() ← merge even/odd detections, keep higher-scoring
 #  ├── _select_data_and_mask()          ← select best STFT window per detection
 #  ├── _recompute_mask()                ← re-align window to estimated signal start
+#  |    └── _process_segment()         ← STFT for re-aligned window
+#  |         └── normalize_percentile() ← percentile normalisation (DenoisingFunctions_public)
 #  ├── model.predict()                  ← EQS second pass on re-aligned windows
-#  ├── _make_final_selection()          ← window scoring/selection, returns arrays; A ≤ D accepted
+#  ├── _make_final_selection()          ← window scoring/selection; A ≤ D accepted
+#  |    └── get_peaks()                ← peak detection on re-aligned mask timeseries
 #  ├── _apply_eqshyb()                  ← optional, only if eqs2_model loaded and A > 0
-#  |    └── eqs2_model.predict()        ← hybrid time-domain refinement (inputs: noisy + EQS denoised + EQS mask)
+#  |    └── eqs2_model.predict()       ← hybrid model (inputs: noisy + EQS denoised + EQS mask)
 #  ├── _build_streams()                 ← ISTFT + stream assembly, EQS or EQShyb path; sorts by starttime
 #  ├── _filter_close_detections_streams() ← remove near-duplicate detections, keep higher-scoring
 #  ├── _trim_streams()                  ← resolve overlapping detections, apply signal buffer
 #  ├── _output()                        ← zero-fill gaps, write MiniSEED to disk
 #  ├── _pick()                          ← optional, only if picker configured and snippets exist
-#  |    ├── _get_designaled_noise()     ← per-snippet noise = original - denoised
-#  |    └── _process_picks()            ← parallel TTA picking loop (ThreadPoolExecutor)
-#  |         └── _process_snippet()    ← per-detection: TTA augmentation + phase picking + polarity
-#  |              ├── _stream_tta()    ← inject std-scaled white noise, seeded by TTA id
-#  |              ├── picker.annotate()           ← SeisBench batch annotation
-#  |              ├── picker.classify_aggregate() ← aggregate TTA picks
-#  |              ├── _process_peak_times()       ← cluster picks + uncertainty per phase
-#  |              |    ├── _cluster_picks()       ← group nearby picks, one per event
+#  |    ├── _get_designaled_noise()    ← per-snippet noise = original - denoised
+#  |    └── _process_picks()           ← parallel TTA picking loop (ThreadPoolExecutor); returns list of Pick
+#  |         └── _process_snippet()   ← per-detection: TTA augmentation + phase picking + polarity; returns Pick objects
+#  |              ├── _stream_tta()               ← inject std-scaled white noise, seeded by TTA id
+#  |              ├── picker.annotate()            ← SeisBench batch annotation
+#  |              ├── picker.classify_aggregate()  ← aggregate TTA picks
+#  |              ├── _process_peak_times()        ← cluster picks + uncertainty per phase
+#  |              |    ├── _cluster_picks()        ← group nearby picks, one per cluster
 #  |              |    |    └── _weighted_median() ← confidence-weighted pick time
-#  |              |    └── _tta_uncertainty()     ← timing spread across TTA reps
-#  |              |         └── _weighted_std()  ← confidence-weighted std
-#  |              └── _predict_polarity_tta()     ← optional, per accepted P pick; reuses TTA Z collection
-#  └── _save_picks()                    ← scale uncertainties, write picks JSON to disk (same DOY directory)
-
+#  |              |    └── _tta_uncertainty()      ← timing spread across TTA reps
+#  |              |         └── _weighted_std()   ← confidence-weighted std
+#  |              └── _predict_polarity_tta()      ← optional, per accepted P pick; reuses TTA Z collection
+#  └── _save_picks()                    ← serialise Pick objects, scale uncertainties, write picks JSON to disk (same DOY directory)
 
 def apply_pre_filt(data, samp_rate, pre_filt,taper_seconds=300):
     """Apply ObsPy's remove_response pre_filt step (no response correction).
@@ -189,6 +228,29 @@ def _predict_polarity_tta(
         "all_predictions": pred,
     }
 
+from dataclasses import dataclass, field
+from typing import Optional
+
+@dataclass
+class Pick:
+    """
+    Accepted phase pick produced by the picking pipeline.
+
+    time        : obspy.UTCDateTime, pick time
+    uncertainty : float, weighted std of TTA argmax positions (raw sample units;
+                  scaled to seconds in _save_picks via uncertainty_scaling)
+    share       : float, fraction of TTA repetitions whose peak confidence
+                  exceeded the phase confidence threshold
+    event_id    : str, trace id of the Z component (e.g. "CH.SEMOS..HGZ")
+    polarity    : dict | None, result of _predict_polarity_tta(), P picks only.
+                  Keys: 'label' (str), 'probabilities' (np.ndarray shape (3,)),
+                        'all_predictions' (np.ndarray shape (repeat, 3))
+    """
+    time:        object          # obspy.UTCDateTime — not imported at module level
+    uncertainty: float
+    share:       float
+    event_id:    str
+    polarity:    Optional[dict] = field(default=None)
 
 class MaxAbsNorm1D(tf.keras.layers.Layer):
     def __init__(self, eps=1e-6, **kwargs):
@@ -824,15 +886,6 @@ class Denoiser(object):
             data.select(component=self.components[2])[0].data
         ])
 
-        logger.info(f"data_stack columns (components={self.components}): "
-                    f"col0_std={data_stack[:, 0].std():.12f}, "
-                    f"col1_std={data_stack[:, 1].std():.12f}, "
-                    f"col2_std={data_stack[:, 2].std():.12f}, "
-                    f"col0_shape={np.shape(data_stack[:, 0])}, "
-                    f"col1_shape={np.shape(data_stack[:, 1])}, "
-                    f"col2_shape={np.shape(data_stack[:, 2])}, "
-                    f"col0_second_half_std={data_stack[data_stack.shape[0] // 2:, 0].std():.12f}, "
-                    f"col0_second_half_max={np.abs(data_stack[data_stack.shape[0] // 2:, 0]).max():.12f}")
 
         # return (data, data_stack)  # OLD
         return (data, data_stack, gap_intervals)  # NEW
@@ -900,17 +953,11 @@ class Denoiser(object):
                                        shift_correction=0)
 
 
-
         filtered_results, origin = \
             self._compare_arrays_time_overlap(peak_info_even, peak_info_odd)
 
         logger.info(f"_detect_event_signals: {len(filtered_results)} detections found "
                     f"(even peaks: {len(peak_info_even)}, odd peaks: {len(peak_info_odd)})")
-        if len(filtered_results):
-            logger.info(f"  peak index range: {filtered_results[:, 0].min():.0f} — {filtered_results[:, 0].max():.0f} "
-                        f"(of {len(mask_timeseries_even) + len(mask_timeseries_odd)} total bins; "
-                        f"bin spacing {self.bin_spacing}s → "
-                        f"last detection ~{filtered_results[:, 0].max() * self.bin_spacing / 3600:.1f}h into data)")
 
         return (filtered_results, origin, y_predict)
 
@@ -1574,15 +1621,16 @@ class Denoiser(object):
         same TTA collection (no re-augmentation needed).
 
         event_streams  : tuple of (tr_Z, tr_N, tr_E) obspy.Trace objects
-        st_designaled  : obspy.Stream, per-snippet noise for TTA amplitude scaling
+        st_designaled  : obspy.Stream, per-snippet designaled noise for TTA
+                         amplitude scaling
         repeat         : int, number of TTA augmentations
-        pick_tolerance : float, clustering tolerance in seconds
-        p_confidence   : float, min confidence for P picks
-        s_confidence   : float, min confidence for S picks
-        Returns        : dict with keys 'p_picks' and 's_picks', each a list of
-                         (median_utc, uncertainty, fraction_above_conf, event_id)
-                         **P picks additionally carry a polarity dict as fifth**
-                         **element when self.polarity_model is not None.**
+        pick_tolerance : float, clustering tolerance (s)
+        p_confidence   : float, min picker confidence to accept a P pick
+        s_confidence   : float, min picker confidence to accept an S pick
+        Returns        : dict with keys 'p_picks' and 's_picks', each a list
+                         of Pick objects. P picks carry a polarity dict in
+                         Pick.polarity when self.polarity_model is not None;
+                         S picks always have Pick.polarity = None.
         """
         _st_z, _st_1, _st_2 = event_streams
 
@@ -1637,8 +1685,7 @@ class Denoiser(object):
         # **polarity — reuses event_tta_collection, no re-augmentation needed**
         p_picks = []
         for p_median, p_result in zip(p_picks_median, p_results):
-            entry = (p_median, p_result[0], p_result[1], event_id)
-            # **if polarity model configured on self, append polarity dict**
+            polarity = None
             if self.polarity_model is not None:
                 polarity = _predict_polarity_tta(
                     z_tta_collection=event_tta_collection,
@@ -1648,11 +1695,18 @@ class Denoiser(object):
                     polarity_model=self.polarity_model,
                     threshold=self.polarity_threshold,
                 )
-                entry = entry + (polarity,)
-            p_picks.append(entry)
+            p_picks.append(Pick(
+                time=p_median,
+                uncertainty=p_result[0],
+                share=p_result[1],
+                event_id=event_id,
+                polarity=polarity,
+            ))
 
-        s_picks = [(m, r[0], r[1], event_id)
-                   for m, r in zip(s_picks_median, s_results)]
+        s_picks = [
+            Pick(time=m, uncertainty=r[0], share=r[1], event_id=event_id)
+            for m, r in zip(s_picks_median, s_results)
+        ]
 
         return {'p_picks': p_picks, 's_picks': s_picks}
 
@@ -1663,18 +1717,22 @@ class Denoiser(object):
         """
         Parallel TTA picking loop over all detected event snippets.
         Processes each Z/N/E triple independently via ThreadPoolExecutor.
-        Results collected via as_completed(); pick order in output list is
-        non-deterministic but irrelevant since picks carry UTC time and event_id.
+        Results are collected via as_completed(); pick order in the output
+        lists is non-deterministic but irrelevant since each Pick carries
+        an absolute UTC time and event_id.
 
         st_denoised      : obspy.Stream, denoised snippets (Z/N/E triples)
-        st_designaled    : obspy.Stream, per-snippet noise for TTA scaling,
-                           aligned to st_denoised (same number of triples)
+        st_designaled    : obspy.Stream, per-snippet designaled noise for TTA
+                           amplitude scaling, aligned to st_denoised
+                           (same number of Z/N/E triples)
         repeat           : int, number of TTA augmentations per snippet
-        pick_tolerance   : float, clustering tolerance (s)
-        p_confidence     : float, min confidence for P picks
-        s_confidence     : float, min confidence for S picks
-        min_share_models : float, min fraction of TTA reps above threshold
-        Returns          : dict with keys 'p_picks' and 's_picks'
+        pick_tolerance   : float, pick clustering tolerance (s)
+        p_confidence     : float, min picker confidence to accept a P pick
+        s_confidence     : float, min picker confidence to accept an S pick
+        min_share_models : float, min fraction of TTA repetitions that must
+                           exceed the confidence threshold for a pick to be kept
+        Returns          : dict with keys 'p_picks' and 's_picks', each a list
+                           of Pick objects with share > min_share_models
         """
         all_results = {'p_picks': [], 's_picks': []}
 
@@ -1717,11 +1775,9 @@ class Denoiser(object):
                 all_results['p_picks'].extend(result['p_picks'])
                 all_results['s_picks'].extend(result['s_picks'])
 
-        # filter by minimum share of TTA models above confidence threshold
-        all_results['p_picks'] = [e for e in all_results['p_picks']
-                                   if e[2] > min_share_models]
-        all_results['s_picks'] = [e for e in all_results['s_picks']
-                                   if e[2] > min_share_models]
+        all_results['p_picks'] = [p for p in all_results['p_picks'] if p.share > min_share_models]
+        all_results['s_picks'] = [p for p in all_results['s_picks'] if p.share > min_share_models]
+
         return all_results
 
 
@@ -1816,20 +1872,30 @@ class Denoiser(object):
                     f"{len(picks['s_picks'])} S")
         return picks
 
-
-    def _save_picks(self, picks, starttime):
+    def _save_picks(self, picks, starttime, stream_id=None):
         """
-        Save picks to JSON alongside MiniSEED output.
-        Format: {"p_picks": [{"time": ..., "uncertainty": ...,
-                               "share": ..., "id": ...,
-                               "polarity": ..., "polarity_probabilities": ...}, ...],
-                 "s_picks": [...]}
+        Save picks to a JSON file alongside the MiniSEED output.
 
-        picks     : dict from _pick(), keys 'p_picks' and 's_picks'
-                    P pick tuples are (time, uncertainty, share, id) or
-                    (time, uncertainty, share, id, polarity_dict) when
-                    polarity model is configured.
-        starttime : UTCDateTime, used for output directory naming (same as _output)
+        Output format:
+            {
+              "p_picks": [{"time": ..., "uncertainty": ..., "share": ..., "id": ...,
+                           "polarity": ..., "polarity_probabilities": ...}, ...],
+              "s_picks": [{"time": ..., "uncertainty": ..., "share": ..., "id": ...}, ...]
+            }
+        "polarity" and "polarity_probabilities" are present only when a polarity
+        model is configured (Pick.polarity is not None); S picks never carry polarity.
+
+        Uncertainty is scaled from raw TTA sample-domain std to seconds using
+        empirical calibration coefficients in self.uncertainty_scaling.
+
+        picks     : dict with keys 'p_picks' and 's_picks', each a list of Pick
+                    objects as produced by _pick().
+        starttime : obspy.UTCDateTime, used for output directory naming (DOYxxx),
+                    must match the starttime passed to _output().
+        stream_id : str or None, stream identifier without component character,
+                    e.g. "CH.SEMOS..HG". When None, derived from the first
+                    available pick's event_id by stripping the trailing component
+                    character (event_id[:-1]).
         """
         dir_tmp = str(Path(self.model_name).parent /
                       ("DOY" + str(starttime.julday).zfill(3))) + "/"
@@ -1839,28 +1905,33 @@ class Denoiser(object):
         for phase, pick_list in picks.items():
             entries = []
             for pick in pick_list:
-                t, u, s, eid = pick[:4]
-
-                # scale raw TTA std to physically meaningful seconds;
-                # coefficients derived from empirical calibration against reference picks
                 coeff = self.uncertainty_scaling[phase]
-                uncertainty_scaled = (coeff['scale_sample'] * u + coeff['offset_sample']) / self.stft_parameters["fs"]
+                uncertainty_scaled = (
+                                             coeff['scale_sample'] * pick.uncertainty + coeff['offset_sample']
+                                     ) / self.stft_parameters["fs"]
 
-                entry = {"time": str(t), "uncertainty": uncertainty_scaled, "share": s, "id": eid}
-                # polarity dict present as fifth element for P picks
-                if len(pick) == 5:
-                    polarity = pick[4]
-                    entry["polarity"] = polarity["label"]
-                    entry["polarity_probabilities"] = polarity["probabilities"].tolist()
-                    # entry["polarity_all_predictions"] = polarity["all_predictions"].tolist()
+                entry = {
+                    "time": str(pick.time),
+                    "uncertainty": uncertainty_scaled,
+                    "share": pick.share,
+                    "id": pick.event_id,
+                }
+                if pick.polarity is not None:
+                    entry["polarity"] = pick.polarity["label"]
+                    entry["polarity_probabilities"] = pick.polarity["probabilities"].tolist()
                 entries.append(entry)
             serialisable[phase] = entries
 
-        out_path = dir_tmp + f"picks_DOY{str(starttime.julday).zfill(3)}.json"
+        if stream_id is None:
+            first = (picks['p_picks'] or picks['s_picks'] or [None])[0]
+            station_id = first.event_id[:-1] if first else "unknown"
+            out_path = dir_tmp + f"picks_{station_id}_DOY{str(starttime.julday).zfill(3)}.json"
+        else:
+            out_path = dir_tmp + f"picks_{stream_id}_DOY{str(starttime.julday).zfill(3)}.json"
+
         with open(out_path, "w") as f:
             json.dump(serialisable, f, indent=2)
         logger.info(f"Picks written to {out_path}")
-
     # =========================================================================
     # END picking methods
     # =========================================================================
@@ -1904,23 +1975,30 @@ class Denoiser(object):
     def run_data(self, network, station, location, channel, starttime,
                  endtime, data=None):
         """
-        Principal method, driving the rest of the code.
+        Principal method driving the full denoising pipeline for given
+        time window.
 
-        Parameters:
-        network: network code
-        station: station code
-        location: location code
-        channel: channel code
-        starttime: start time (obspy.core.UTCDateTime)
-        endtime: end time  (obspy.core.UTCDateTime)
+        Fetches and restitutes waveforms, computes STFTs, runs the EQS
+        in two passes (detection + re-aligned refinement), optionally applies
+        the EQShyb time-domain model, assembles denoised streams, writes
+        MiniSEED to disk, and optionally runs TTA phase picking.
 
-        Returns: writes to disk, currently doesn't return anything.
+        network   : str, FDSN network code
+        station   : str, FDSN station code
+        location  : str, FDSN location code (wildcards accepted)
+        channel   : str, 2-char channel prefix, e.g. "HH" or "HG"
+                    (component wildcard appended internally)
+        starttime : obspy.UTCDateTime, start of the processing window
+        endtime   : obspy.UTCDateTime, requested end of the processing window;
+                    adjusted internally to the next exact multiple of 61.2 s
+        data      : obspy.Stream or None, pre-fetched raw waveforms;
+                    if None, data are fetched via self.data_client
+        Returns   : None — results are written to disk (MiniSEED + picks JSON)
         """
 
         logger.debug("")
 
         # starttime and endtime should be multiples of 61.2s
-
         # IN:  starttime (UTCDateTime, start of processing window),
         #      endtime (UTCDateTime, requested end of processing window)
         # OUT: endtime (UTCDateTime, adjusted so that endtime - starttime
@@ -2026,10 +2104,10 @@ class Denoiser(object):
                                               utc_start_subset, data_stack,
                                               data[0].stats.starttime)
 
-        # stream construction — uses EQShyb output if available, else EQS ISTFT
+        # IN:  stft_final_subset (A, 64, 256, 6), masks_subset (A, 64, 256, 3),
         #      utc_start_subset (list, A), stream_start_end_final (list, A),
         #      data (Stream, for trace metadata),
-        #      denoised_hyb (A, 6120, 3) or None — if None uses EQS ISTFT path
+        #      denoised_hyb (np.ndarray, (A, 6120, 3)) or None — if None uses EQS ISTFT path
         # OUT: trimmed_streams (obspy.Stream, sorted denoised traces),
         #      stream_start_end_final (list of (UTCDateTime, UTCDateTime), A, sorted)
         trimmed_streams, stream_start_end_final = \
@@ -2051,7 +2129,6 @@ class Denoiser(object):
             logger.info("No detections remaining after proximity filter")
             return None
 
-        # trimmed_streams = self._trim_streams(trimmed_streams, stream_start_end)  # OLD
         # IN:  trimmed_streams (obspy.Stream), stream_start_end_final (list, A)
         # OUT: trimmed_streams (obspy.Stream, overlap-trimmed)
         trimmed_streams = self._trim_streams(trimmed_streams, stream_start_end_final)  # NEW
@@ -2070,81 +2147,4 @@ class Denoiser(object):
         # OUT: picks written to JSON on disk; MiniSEED already saved above as checkpoint
         if self.picker is not None and len(trimmed_streams):
             picks = self._pick(trimmed_streams, data)
-            self._save_picks(picks, data[0].stats.starttime)
-
-# %%
-if __name__ == "__main__":
-
-    # %% With picker + polarity
-    from obspy import UTCDateTime
-    from obspy.clients.fdsn import Client
-    import sys
-    sys.path.append("/home/niko/Earthquake-Seismogram-Denoiser/Code")
-    from Denoiser_EQShyb import Denoiser
-
-    import seisbench.models as sbm
-
-    picker = sbm.EQTransformer.from_pretrained("ethz")
-
-    # clients
-    data_client     = Client("ETH")      # or "IRIS", "GFZ", SDS client, etc.
-    metadata_client = Client("ETH")      # fdsn client for response
-
-    denoiser = Denoiser(
-        data_client     = data_client,
-        metadata_client = metadata_client,
-        model_path      = "/home/niko/Earthquake-Seismogram-Denoiser/Models/model_1000k_onlyweights.keras",
-        min_peak_height = 0.33,
-        eqs2_model_path = "/home/niko/Earthquake-Seismogram-Denoiser/Models/EQS2.keras",  # optional, omit for EQS only
-        picker=picker,  # optional, omit to skip picking
-        picking_kwargs={
-            "repeat": 20,
-            "pick_tolerance": 1,
-            "p_confidence": 0.5,
-            "s_confidence": 0.5,
-            "min_share_models": 0.25
-        },
-        polarity_model_path="/home/niko/Schreibtisch/Polarity/Model/polarity_cnn_mixeddata_globalmaxavg_dropout02.keras",
-
-        polarity_kwargs={"threshold": 0.33},
-        debug=True
-    )
-
-    # ── single window ─────────────────────────────────────────────────────────
-    denoiser.run_data(
-        network   = "CH",
-        station   = "SEMOS",
-        location  = "*",
-        channel   = "HG",
-        starttime = UTCDateTime("2025-02-07T17:00:00"),
-        endtime   = UTCDateTime("2025-02-08T17:00:00")
-    )
-# %%
-from obspy import read
-st = read("/home/niko/Earthquake-Seismogram-Denoiser/Models/DOY038/CH.SEMOS..HG_denoised.mseed")
-st.plot()
-# st = st.select(component="Z").merge().trim(starttime,endtime, fill_value=0, pad=True)
-# st.plot(type="dayplot",interval=1,vertical_scaling_range=10000)
-# %%
-#
-import json
-import matplotlib.pyplot as plt
-from obspy import UTCDateTime
-
-with open("/home/niko/Earthquake-Seismogram-Denoiser/Models/DOY038/picks_DOY038.json") as f:
-    picks = json.load(f)
-
-p_times = [UTCDateTime(p["time"]) for p in picks["p_picks"]]
-s_times = [UTCDateTime(s["time"]) for s in picks["s_picks"]]
-
-fig, ax = plt.subplots(figsize=(14, 3))
-ax.vlines([t.matplotlib_date for t in p_times], 0, 1, color="red",   label=f"P ({len(p_times)})")
-ax.vlines([t.matplotlib_date for t in s_times], 0, 1, color="blue",  label=f"S ({len(s_times)})")
-ax.xaxis_date()
-fig.autofmt_xdate()
-ax.set_xlabel("Time")
-ax.set_yticks([])
-ax.legend()
-ax.set_title("Picks DOY038")
-plt.tight_layout()
-plt.show()
+            self._save_picks(picks, data[0].stats.starttime,data[0].id[:-1])
