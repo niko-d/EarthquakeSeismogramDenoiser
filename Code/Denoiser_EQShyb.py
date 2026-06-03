@@ -25,6 +25,7 @@ _PROGRAM_START = time.perf_counter()
 logger = logging.getLogger(__name__)
 
 SENTINEL = object()
+
 # ─── Module-level definitions ─────────────────────────────────────────────────
 #
 #  Functions (module-level):
@@ -82,7 +83,6 @@ SENTINEL = object()
 #  ├── _build_streams()                 ← ISTFT + stream assembly, EQS or EQShyb path; sorts by starttime
 #  ├── _filter_close_detections_streams() ← remove near-duplicate detections, keep higher-scoring
 #  ├── _trim_streams()                  ← resolve overlapping detections, apply signal buffer
-#  ├── _output()                        ← zero-fill gaps, write MiniSEED to disk
 #  ├── _pick()                          ← optional, only if picker configured and snippets exist
 #  |    ├── _get_designaled_noise()    ← per-snippet noise = original - denoised
 #  |    └── _process_picks()           ← parallel TTA picking loop (ThreadPoolExecutor); returns list of Pick
@@ -96,8 +96,9 @@ SENTINEL = object()
 #  |              |    └── _tta_uncertainty()      ← timing spread across TTA reps
 #  |              |         └── _weighted_std()   ← confidence-weighted std
 #  |              └── _predict_polarity_tta()      ← optional, per accepted P pick; reuses TTA Z collection
-#  └── _save_picks()                    ← serialise Pick objects, scale uncertainties, write picks JSON to disk (same DOY directory)
-
+#  ├── _save_picks()                    ← serialise Pick objects, scale uncertainties, write picks JSON to disk (same DOY directory)
+#  ├── _filter_streams_by_picks()       ← optional, only if filter_by_pick enabled; keep detections with P or S pick
+#  └── _output()                        ← zero-fill gaps, write MiniSEED to disk
 def apply_pre_filt(data, samp_rate, pre_filt,taper_seconds=300):
     """Apply ObsPy's remove_response pre_filt step (no response correction).
 
@@ -341,7 +342,7 @@ class Denoiser(object):
                  model_path, min_peak_height, eqs2_model_path=None,
                  picker=None, picking_kwargs=None,
                  polarity_model_path=None, polarity_kwargs=None,
-                 debug=False):
+                 filter_by_pick=False,debug=False):
         """
         data_client          : obspy client to get data
         metadata_client      : obspy client to get metadata
@@ -358,30 +359,31 @@ class Denoiser(object):
                                'threshold' (float, default 0.33) — minimum
                                winning class probability to accept a polarity
                                label, below which 'undecidable' is returned
+        filter_by_pick       : optional bool (default False); if True, only detections
+                                   with at least one P or S pick are written to MiniSEED;
+                                   requires picker to be set, otherwise has no effect
         debug                : enable verbose logging
         """
 
-        self.min_peak_height = min_peak_height
-        self.data_client = data_client
-        self.metadata_client = metadata_client
-        self.threshold = 10
-        self.buffer = 300
-        self.len_sample = 6120
-        self.shift_samples = int(self.len_sample / 2)
-        self.bins_overlap = 128
-        self.model_name = model_path
-        self.pre_filt = [1 / 100, 1 / 20, 45, 50]
+        self.min_peak_height = min_peak_height  # main detection threshold
+        self.data_client = data_client  # data client
+        self.metadata_client = metadata_client  # metadata client
+        self.threshold = 10  # minimum summed mask value over a detection window to accept a peak
+        self.buffer = 300 # pre/post buffer (s) added to data fetch window for response removal (reduce for shorter time windows)
+        self.len_sample = 6120  # length of denoiser prediction window
+        self.shift_samples = int(self.len_sample / 2)  # hop size between even/odd STFT streams (half window)
+        self.bins_overlap = 128  # number of overlapping STFT time bins between adjacent windows
+        self.model_name = model_path  # path to EQS model, reused for output directory naming
+        self.pre_filt = [1 / 100, 1 / 20, 45, 50]   # bandpass corners (Hz) for cosine taper pre-filter
         self.stft_parameters = {"nperseg": 48, "nfft": 126, "fs": 100,"noverlap": 24}
-        self.REALIGN_SCORE_TOLERANCE = 0.5#1 # 0.5 # NEW added
+        self.REALIGN_SCORE_TOLERANCE = 1 # 0.5 # NEW added
         self.signal_buffer_s = 3.0  # buffer to start save denoised stream with at least 3s before signal start (ideally)
         self.one_sample_s = 1.0 / self.stft_parameters["fs"]  # = 0.01s at 100 Hz
 
-        # t = np.linspace(0, 61.2, 256)  # OLD
-        # self.bin_spacing = (255/256) * (t[1]-t[0])  # OLD
         self.bin_spacing = (self.stft_parameters["nperseg"] - self.stft_parameters["noverlap"]) / self.stft_parameters["fs"]  # = 0.24
 
         self.response_cache = {}
-        self.model = tf.keras.models.load_model(model_path, compile=False)
+        self.model = tf.keras.models.load_model(model_path, compile=False)  # EQS model
 
         # EQShyb / EQS2
         self.eqs2_model = tf.keras.models.load_model(
@@ -391,23 +393,29 @@ class Denoiser(object):
         ) if eqs2_model_path else None
 
         # PICKER
-        self.picker = picker
-        self.picking_kwargs = picking_kwargs or {}
-        self.uncertainty_scaling = {
-            'p_picks': {'scale_sample': 4*1.904, 'offset_sample': 9.249},
-            's_picks': {'scale_sample': 4*2.211, 'offset_sample': 3.600},
-        }
+        self.picker = picker  # passed seisbench picker
+        self.picking_kwargs = picking_kwargs or {}   # picking kwargs
+        if eqs2_model_path is None: # uncertainty scaling; calibrated for EQS + EQTransformer-ethz, check floor in weighed_std
+            self.uncertainty_scaling = {
+                'p_picks': {'scale_sample': 4*1.904, 'offset_sample': 9.249},
+                's_picks': {'scale_sample': 4*2.211, 'offset_sample': 3.600},
+            }
+            logger.warning("adjust floor in weighted_std for EQS uncertainty scaling")
+        else: # calibrated for EQS2 + EQTransformer-ethz
+            self.uncertainty_scaling = {
+                'p_picks': {'scale_sample': 11.622, 'offset_sample': 0},
+                's_picks': {'scale_sample': 12.348, 'offset_sample': 0},
+            }
         # POLARITY
         self.polarity_model = tf.keras.models.load_model(
             polarity_model_path,
             custom_objects={"custom>MaxAbsNorm1D": MaxAbsNorm1D},
             compile=False
         ) if polarity_model_path else None
-        self.polarity_threshold = (polarity_kwargs or {}).get('threshold', 0.33)
+        self.polarity_threshold = (polarity_kwargs or {}).get('threshold', 0.33)  # polarity minimum threshold; 0.33 --> effectively no threshold
 
-
+        self.filter_by_pick = filter_by_pick  # if True, only write MiniSEED for detections with a P or S pick
         self.components = None  # set in _get_data()
-
 
         setup_logging(debug=debug)
         logger.debug("")
@@ -1406,7 +1414,7 @@ class Denoiser(object):
     # are called from run_data(); all others are internal helpers.
     # =========================================================================
 
-    def _weighted_std(self, values, weights):
+    def _weighted_std(self, values, weights, floor=0):
         """
         Compute the weighted standard deviation of an array.
         Used by _tta_uncertainty() to quantify pick timing spread across TTA reps.
@@ -1417,7 +1425,7 @@ class Denoiser(object):
         """
         average = np.average(values, weights=weights + 1e-30)
         variance = np.average((values - average) ** 2, weights=weights + 1e-30)
-        return np.sqrt(variance)
+        return np.sqrt(variance + floor**2)
 
 
     def _weighted_median(self, argmax_values, max_values):
@@ -1488,7 +1496,7 @@ class Denoiser(object):
         _argmax = [np.argmax(trace.data) for trace in sliced_traces]
         _max = np.array([np.max(trace.data) for trace in sliced_traces])
         reached_threshold = np.mean(_max > confidence)
-        return 1 + self._weighted_std(_argmax, _max), reached_threshold
+        return self._weighted_std(_argmax, _max, floor=1), reached_threshold
 
 
     def _process_peak_times(self, peak_times, peak_vals, annotations,
@@ -1906,8 +1914,7 @@ class Denoiser(object):
             entries = []
             for pick in pick_list:
                 coeff = self.uncertainty_scaling[phase]
-                uncertainty_scaled = (
-                                             coeff['scale_sample'] * pick.uncertainty + coeff['offset_sample']
+                uncertainty_scaled = (coeff['scale_sample'] * pick.uncertainty + coeff['offset_sample']
                                      ) / self.stft_parameters["fs"]
 
                 entry = {
@@ -1932,6 +1939,33 @@ class Denoiser(object):
         with open(out_path, "w") as f:
             json.dump(serialisable, f, indent=2)
         logger.info(f"Picks written to {out_path}")
+
+    def _filter_streams_by_picks(self, trimmed_streams, picks):
+        """
+        Keep only detections that have at least one P or S pick falling
+        within their time window.
+
+        trimmed_streams : obspy.Stream, Z/N/E triples, one per detection
+        picks           : dict with keys 'p_picks' and 's_picks', each a
+                          list of Pick objects as returned by _pick()
+        Returns         : obspy.Stream, filtered to detections with picks
+        """
+        all_pick_times = (
+                [p.time for p in picks['p_picks']]
+                + [p.time for p in picks['s_picks']]
+        )
+        n = len(trimmed_streams) // 3
+        kept = obspy.core.Stream()
+        for i in range(n):
+            triple = trimmed_streams[3 * i: 3 * (i + 1)]
+            tr_z = triple.select(component=self.components[0])[0]
+            t0, t1 = tr_z.stats.starttime, tr_z.stats.endtime
+            if any(t0 <= pt <= t1 for pt in all_pick_times):
+                kept += triple
+        logger.info(
+            f"filter_by_pick: keeping {len(kept) // 3}/{n} detections with picks"
+        )
+        return kept
     # =========================================================================
     # END picking methods
     # =========================================================================
@@ -2133,18 +2167,32 @@ class Denoiser(object):
         # OUT: trimmed_streams (obspy.Stream, overlap-trimmed)
         trimmed_streams = self._trim_streams(trimmed_streams, stream_start_end_final)  # NEW
 
-        # output - save to MSEED
-        # IN:  data[0].stats.starttime (UTCDateTime, for output directory naming),
-        #      trimmed_streams (obspy.Stream, overlap-trimmed denoised traces),
-        #      gap_intervals (list of (UTCDateTime, UTCDateTime), gap regions to zero-mask
-        #                    in output — empty list if no gaps)
-        # OUT: writes denoised MiniSEED to disk with gap regions zeroed, returns nothing
-        self._output(data[0].stats.starttime, trimmed_streams, gap_intervals)
-
         # phase picking — optional, only if picker configured and snippets exist
         # IN:  trimmed_streams (obspy.Stream, denoised snippets only),
         #      data (obspy.Stream, original restituted, in memory only — not re-fetched)
-        # OUT: picks written to JSON on disk; MiniSEED already saved above as checkpoint
+        # OUT: picks (dict, keys 'p_picks'/'s_picks', each a list of Pick objects),
+        #      picks written to JSON on disk
+        picks = None
         if self.picker is not None and len(trimmed_streams):
             picks = self._pick(trimmed_streams, data)
-            self._save_picks(picks, data[0].stats.starttime,data[0].id[:-1])
+            self._save_picks(picks, data[0].stats.starttime, data[0].id[:-1])
+
+        # filter by pick — optional, only if filter_by_pick enabled and picks exist
+        # IN:  trimmed_streams (obspy.Stream, overlap-trimmed denoised traces),
+        #      picks (dict, keys 'p_picks'/'s_picks', or None if picker not configured)
+        # OUT: streams_to_save (obspy.Stream, subset of trimmed_streams whose time
+        #      window contains at least one accepted P or S pick;
+        #      equals trimmed_streams unchanged if filter_by_pick is False or picks
+        streams_to_save = (
+            self._filter_streams_by_picks(trimmed_streams, picks)
+            if self.filter_by_pick and picks is not None
+            else trimmed_streams)
+
+        # output - save to MSEED
+        # IN:  data[0].stats.starttime (UTCDateTime, for output directory naming),
+        #      streams_to_save (obspy.Stream, overlap-trimmed denoised traces,
+        #                       optionally filtered to pick-confirmed detections only)
+        #      gap_intervals (list of (UTCDateTime, UTCDateTime), gap regions to zero-mask
+        #                    in output — empty list if no gaps)
+        # OUT: writes denoised MiniSEED to disk with gap regions zeroed, returns nothing
+        self._output(data[0].stats.starttime, streams_to_save, gap_intervals)
