@@ -1,5 +1,5 @@
 import obspy.core
-import cupy as cp
+#import cupy as cp
 import numpy as np
 import scipy
 import time
@@ -7,16 +7,18 @@ import logging
 import threading
 import queue
 import tensorflow as tf
+import Picker
+import os
 
 from obspy.signal.invsim import cosine_taper, cosine_sac_taper
 from obspy.signal.util import _npts2nfft
 from functools import cache
-from DenoisingFunctions_public import check_dir, normalize_percentile
 from scipy.signal import find_peaks
 from pathlib import Path
 from scipy.signal import istft
 from obspy import Stream, Trace 
 from tensorflow.keras.layers import Layer
+from sklearn.preprocessing import RobustScaler
 
 tf.config.set_visible_devices([], 'GPU')
 _PROGRAM_START = time.perf_counter()
@@ -24,6 +26,42 @@ _PROGRAM_START = time.perf_counter()
 logger = logging.getLogger(__name__)
 
 SENTINEL = object()
+
+def check_dir(_dir):
+    if not os.path.exists(_dir):
+        os.makedirs(_dir)
+
+def normalize_percentile(data,quantile_range=(25,75),unit_variance=False,limit=1000):
+    """
+    Robust normalisation of samples  1-component data
+    For data with outliers (w hard/soft clipping), seperately for real and imag.
+    Input: data and optional arguments
+    Output: normalised data
+    Requires: sklearn Robustscaler
+    """
+    # get data
+    data_real = data[:,:,0]  # real
+    data_imag = data[:,:,1]  # imag
+    # define scaler
+    scaler =  RobustScaler(unit_variance=unit_variance)
+    # apply to data: first flatten and then reshape
+    data_real_norm = scaler.fit_transform(np.expand_dims(data_real.flatten(),1)).reshape((64,256))
+    data_imag_norm = scaler.fit_transform(np.expand_dims(data_imag.flatten(),1)).reshape((64,256))
+
+
+    # clip high values: hard clippping
+
+    data_real_norm[data_real_norm>limit]=limit
+    data_real_norm[data_real_norm<-limit]=-limit
+    data_imag_norm[data_imag_norm>limit]=limit
+    data_imag_norm[data_imag_norm<-limit]=-limit
+
+    data_return = np.zeros(data.shape)
+    data_return[:,:,0] = data_real_norm
+    data_return[:,:,1] = data_imag_norm
+
+    return data_return
+
 
 
 class MaxAbsNorm1D(tf.keras.layers.Layer):
@@ -167,7 +205,10 @@ class Denoiser(object):
         ) if eqs2_model_path else None
 
         # PICKER
-        self.picker = picker
+        self.picker = None
+        if picker:
+            self.picker = Picker.Picker(logger, picker, model_path, self.stft_parameters, picking_kwargs, polarity_model_path, polarity_kwargs)
+            print("Picker now: ", self.picker)
         self.picking_kwargs = picking_kwargs or {}
         self.uncertainty_scaling = {
             'p_picks': {'scale_sample': 4*1.904, 'offset_sample': 9.249},
@@ -1454,8 +1495,8 @@ class Denoiser(object):
         #      data (obspy.Stream, original restituted, in memory only — not re-fetched)
         # OUT: picks written to JSON on disk; MiniSEED already saved above as checkpoint
         if self.picker is not None and len(trimmed_streams):
-            picks = self._pick(trimmed_streams, data)
-            self._save_picks(picks, data[0].stats.starttime)
+            picks = self.picker._pick(trimmed_streams, data, self.components)
+            self.picker._save_picks(picks, data[0].stats.starttime, True, trimmed_streams)
     
 
   
