@@ -1496,7 +1496,7 @@ class Denoiser(object):
         # OUT: picks written to JSON on disk; MiniSEED already saved above as checkpoint
         if self.picker is not None and len(trimmed_streams):
             picks = self.picker._pick(trimmed_streams, data, self.components)
-            self.picker._save_picks(picks, data[0].stats.starttime, True, trimmed_streams)
+            self.picker._save_picks(picks, data[0].stats.starttime, True, trimmed_streams, data)
     
 
   

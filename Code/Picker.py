@@ -503,7 +503,7 @@ class Picker(object):
         return picks
 
 
-    def _save_picks(self, picks, starttime, plot = False, traces = False):
+    def _save_picks(self, picks, starttime, plot = False, traces = False, orig_data = None):
         """
         Save picks to JSON alongside MiniSEED output.
         Format: {"p_picks": [{"time": ..., "uncertainty": ...,
@@ -538,14 +538,23 @@ class Picker(object):
                 if traces and plot:
                     for trace in traces:
                         print(trace.id, eid, trace.stats.starttime, trace.stats.endtime, t)
-                        if trace.id == eid and trace.stats.starttime <= t and trace.stats.endtime >= t:
-                            print("Match")
-                            fig = trace.plot(show=False)
-                            ax = fig.axes[0]
-                            color = 'g'
-                            if 's_' in phase or 'S_' in phase:
-                                color='b'
-                            ax.axvline(t, color=color, linewidth=2)
+                        if trace.id == eid and trace.stats.starttime <= t and trace.stats.endtime >= t and data:
+                            data = orig_data.copy()
+                            data = data.select(id=trace.id)
+                            print(data)
+                            data.trim(trace.stats.starttime, trace.stats.endtime)
+                            print(data)
+                            data[0].stats.channel = 'CPY'
+                            
+                            stream = obspy.core.Stream([trace, data[0]])
+                            fig = stream.plot(show=False)
+                            
+                            #trace.plot(show=False)
+                            for ax in fig.axes:
+                                color = 'g'
+                                if 's_' in phase or 'S_' in phase:
+                                    color='b'
+                                ax.axvline(t, color=color, linewidth=2)
                             fig.savefig(f"/tmp/{trace.id}-{str(t)}.png")
                             break
 
