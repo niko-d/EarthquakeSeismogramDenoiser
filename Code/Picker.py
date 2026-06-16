@@ -538,7 +538,7 @@ class Picker(object):
                 if traces and plot:
                     for trace in traces:
                         print(trace.id, eid, trace.stats.starttime, trace.stats.endtime, t)
-                        if trace.id == eid and trace.stats.starttime <= t and trace.stats.endtime >= t and data:
+                        if trace.id == eid and trace.stats.starttime <= t and trace.stats.endtime >= t and orig_data:
                             data = orig_data.copy()
                             data = data.select(id=trace.id)
                             print(data)

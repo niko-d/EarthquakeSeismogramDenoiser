@@ -189,6 +189,8 @@ class Denoiser(object):
         self.REALIGN_SCORE_TOLERANCE = 0.5#1 # 0.5 # NEW added
         self.signal_buffer_s = 3.0  # buffer to start save denoised stream with at least 3s before signal start (ideally)
         self.one_sample_s = 1.0 / self.stft_parameters["fs"]  # = 0.01s at 100 Hz
+        self.realtime_queue = None # set only in realtime use
+        self.realtime_mode = False
 
         # t = np.linspace(0, 61.2, 256)  # OLD
         # self.bin_spacing = (255/256) * (t[1]-t[0])  # OLD
@@ -392,6 +394,7 @@ class Denoiser(object):
         data -= data.mean()
     
         p_fraction = (taper_seconds * samp_rate) / npts
+        print(f"fraction: {p_fraction}, {taper_seconds}, {samp_rate}, {npts}")
         data *= cosine_taper(npts, p=p_fraction, sactaper=True, halfcosine=False)
     
         nfft  = _npts2nfft(npts)
@@ -726,11 +729,11 @@ class Denoiser(object):
         """
 
         logger.debug("")
-        buffer = self.buffer
+        buffer = 10
 
-        if not data:
+        if not data or True:
             data = self.data_client.get_waveforms(network, station,
-                                                  location, f"{channel}?",
+                                                  location, f"{channel[0:2]}?",
                                                   starttime - buffer,
                                                   endtime + buffer)
 
@@ -741,9 +744,9 @@ class Denoiser(object):
         data.merge(fill_value=0, method=1)
 
         if len(data) != 3:
-            logger.debug("Couldn't receive all data for "
-                         "{network}.{station}.{location}.{channel}"
-                         "{starttime} {endtime}")
+            logger.debug(f"Couldn't receive all data for "
+                         f"{network}.{station}.{location}.{channel}"
+                         f"{starttime} {endtime}")
             return None
 
         metadata = self._get_metadata(network, station, location,
@@ -1351,7 +1354,10 @@ class Denoiser(object):
         #      endtime (UTCDateTime, requested end of processing window)
         # OUT: endtime (UTCDateTime, adjusted so that endtime - starttime
         #               is an exact multiple of 61.2s, rounded up)
-        endtime = self._round_to_window(starttime, endtime)
+        
+        # no rounding in case of realtime mode, this is then done by the feeding software
+        if not self.realtime_mode:
+            endtime = self._round_to_window(starttime, endtime)
 
 
         # IN:  network, station, location, channel, starttime, endtime, data (optional raw Stream)
@@ -1497,6 +1503,31 @@ class Denoiser(object):
         if self.picker is not None and len(trimmed_streams):
             picks = self.picker._pick(trimmed_streams, data, self.components)
             self.picker._save_picks(picks, data[0].stats.starttime, True, trimmed_streams, data)
+    
+    # methods for realtime processing
+    
+    def push(self, trace):
+        stream = obspy.core.Stream([trace])
+        self.realtime_queue.put((stream, trace.stats.starttime, trace.stats.endtime,
+                              trace.stats.network, trace.stats.station, 
+                              trace.stats.location, trace.stats.channel))
+    
+    def setup_realtime_processing(self, no_of_threads = 4):
+        self.realtime_queue = queue.Queue(maxsize=256)
+        self.realtime_mode = True
+        self._workers = []
+        
+        for i in range(no_of_threads):
+            t = threading.Thread(
+                args=(self.realtime_queue,),
+                target=self._consumer_thread,
+                name=f"consumer-{i}",
+                daemon=True
+                )
+            t.start()
+            self._workers.append(t)
+        pass
+    
     
 
   
