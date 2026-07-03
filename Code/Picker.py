@@ -5,10 +5,82 @@ from obspy import Stream, Trace
 from pathlib import Path
 import os
 import json
+import tensorflow as tf
+from Common import MaxAbsNorm1D
+
+
 
 def check_dir(_dir):
     if not os.path.exists(_dir):
         os.makedirs(_dir)
+
+def _predict_polarity_tta(
+    z_tta_collection,
+    z_starttime,
+    z_sampling_rate,
+    p_pick,
+    polarity_model,
+    win=256,
+    threshold=0.33,
+):
+    """
+    Polarity prediction using the already-augmented TTA Z traces from
+    _stream_tta — no re-augmentation or noise re-scaling needed.
+
+    z_tta_collection  : obspy.Stream, full TTA collection from _stream_tta,
+                        containing repeat Z/N/E augmented traces
+    z_starttime       : obspy.UTCDateTime, starttime of the original Z snippet
+                        (before the +add padding in _process_snippet)
+    z_sampling_rate   : float, samples per second
+    p_pick            : obspy.UTCDateTime, accepted P pick time
+    polarity_model    : tf.keras.Model, input shape (batch, win) or (batch, win, 1)
+    win               : int, sample window centred on P pick (default 256)
+    threshold         : float, min winning class probability; below → undecidable
+
+    Returns dict:
+        label            : str, 'positive' | 'negative' | 'undecidable'
+        probabilities    : np.ndarray shape (3,), mean softmax over TTA batch
+        all_predictions  : np.ndarray shape (repeat, 3), per-repetition softmax
+    """
+    labels = np.array(["negative", "undecidable", "positive"])
+
+    p_idx = int(round((p_pick - z_starttime) * z_sampling_rate))
+    half  = win // 2
+
+    batch = []
+    for tr in z_tta_collection.select(component='Z'):
+        fig = tr.plot(show=False)
+        fig.savefig(f"/tmp/{tr.id}-{tr.stats.starttime}.png")
+        z = np.asarray(tr.data, dtype=np.float32)
+        z_win = np.zeros(win, dtype=np.float32)
+        start = p_idx - half
+        src0  = max(start, 0)
+        src1  = min(start + win, z.shape[0])
+        dst0  = src0 - start
+        z_win[dst0: dst0 + (src1 - src0)] = z[src0:src1]
+        batch.append(z_win)
+
+    z_batch = np.stack(batch, axis=0)                                    # (repeat, win)
+    abs_max = np.maximum(np.max(np.abs(z_batch), axis=1, keepdims=True), 1e-20)
+    z_batch /= abs_max
+
+    if polarity_model.input_shape[-1] == 1:
+        z_batch = z_batch[:, :, np.newaxis]                              # (repeat, win, 1)
+
+    pred      = polarity_model(z_batch, training=True).numpy()           # (repeat, 3)
+    mean_pred = pred.mean(axis=0)                                        # (3,)
+
+    label = labels[np.argmax(mean_pred)]
+    if mean_pred.max() < threshold:
+        label = "undecidable"
+
+    return {
+        "label":           label,
+        "probabilities":   mean_pred,
+        "all_predictions": pred,
+    }
+
+
 
 
 class Picker(object):
