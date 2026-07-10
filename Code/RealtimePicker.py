@@ -4,7 +4,7 @@
 # processing. 
 # 
 
-import Denoiser
+import RealtimeDenoiser
 import obspy.clients.seedlink.easyseedlink
 import obspy.realtime.rttrace
 import seisbench.models as sbm
@@ -20,15 +20,66 @@ class Client(obspy.clients.seedlink.easyseedlink.EasySeedLinkClient):
     def on_data(self, trace):
         self.callback(trace)
 
+class DataStream(object):
+    
+    def __init__(self, trace):
+        self.stream = []
+        self.id = trace.id[0:-1]
+        self.add(trace)
+        self.next_process = trace.stats.starttime + 85
+        pass
+    
+    def __iter__(self):
+        return iter(self.stream)
+
+    def add(self, trace):
+        # add if trace.id[0:-1] matches, otherwise return False
+        if trace.id[0:-1] != self.id:
+            return False
+        for tr in self.stream:
+            if tr.id == trace.id:
+                if abs(trace.stats.endtime - tr.stats.endtime) > 180 or abs(trace.stats.starttime - tr.stats.starttime) > 180 or trace.stats.starttime < tr.stats.endtime:
+                    print(f"{tr.id}: bogus data detected, reinitialising")
+                    self.stream = []
+                    break
+                tr.append(trace)
+                return True
+        newtrace = obspy.realtime.rttrace.RtTrace(max_length=130)
+        newtrace.append(trace)
+        self.stream.append(newtrace)
+        return True
+    
+    def print(self):
+        for trace in self.stream:
+            print(trace)
+
+    def length(self):
+        # show maximum length if it holds three traces (all components)
+        # i.e. the length that all three components have in common
+        # if it holds less, return 0
+        if len(self.stream) < 3:
+            return 0
+        return self.endtime() - self.starttime()
+    
+    def starttime(self):
+        # shows maximum starttime of all three traces or none if there are not three traces
+        if len(self.stream) < 3: 
+            return None
+        return max([trace.stats.starttime for trace in self.stream])
+    
+    def endtime(self):
+         # shows minimum endtime of all three traces or none if there are not three traces
+        if len(self.stream) < 3:
+            return None
+        return min([trace.stats.endtime for trace in self.stream])
+
 class RealtimePicker(object):
     
     def __init__(self, seedlink_address, station_list):
-        self.seedlink_client = Client(seedlink_address, self.add_data)
-        self.traces = {}
-        self.last_processed = {}
-        self.data_length = 70
+        self.seedlink_client = Client(seedlink_address, self.process_data)
         self.shift_size = 61.2 / 2
         self._setup_picking()
+        self.streams = {}
         
         for chn in station_list:
             network, station, location, channel = chn.split('.')
@@ -36,19 +87,8 @@ class RealtimePicker(object):
             self.seedlink_client.select_stream(network, station, locchannel)
         self.seedlink_client.run()
     
-    def add_data(self, trace):
-        if trace.id not in self.traces:
-            self.traces[trace.id] = obspy.realtime.rttrace.RtTrace(max_length=90)
-            
-            def make_process(id):
-                def closure(data):
-                    return self.process_data(data, id)
-                return closure
-            
-            self.traces[trace.id].register_rt_process(make_process(trace.id))
-        self.traces[trace.id].append(trace)
                 
-    def process_data(self, data, id):
+    def process_data(self, trace):
         # general algorithm
         # if less than data_length data is present: do nothing
         # elif data has gaps: empty the buffer
@@ -57,48 +97,27 @@ class RealtimePicker(object):
         # else: Process data from next_data_point to next_data_point + data_length
         #       set next_data_point = next_data_point + shift_size
         
-        trace = self.traces[id]
+                
+        streamid = trace.id[0:-1]
         
-        if not id in self.last_processed:
-            self.last_processed[id] = trace.stats.starttime
+        if streamid in self.streams:
+            self.streams[streamid].add(trace)
+        else:
+            self.streams[streamid] = DataStream(trace)
         
-        # do nothing if data is too short
-        if trace.stats.endtime - trace.stats.starttime < self.data_length:
-            print("Not enough data")
-            return data
+        datastream = self.streams[streamid]
+        if datastream.next_process + 81.2 <= datastream.endtime():
+            stream = obspy.core.Stream([trace.slice(datastream.next_process, 
+                     datastream.next_process + 81.2, nearest_sample=True) 
+                     for trace in datastream])
+            self.denoiser.run_realtime(stream)
+            datastream.next_process += self.shift_size
         
-        # discard data if data has gaps
-        # Not necessary, the library already does this automatically
-        # elif trace.data.is_masked:
-        #    del self.traces[trace.id]
-        #    
-        #    return
+#        else: 
+#            print("Not enough new data")
         
-        # not enough data since last processing, do nothing
-        elif self.last_processed[id] -  self.shift_size + self.data_length > trace.stats.endtime:
-            print("not enough new data")
-            return data
-        
-        # something wrong
-        # hier
-#        elif self.last_processed[id] - self.shift_size < trace.stats.starttime:
-#            print("something wrong")
-#            return data
-        
-        # nothing applies, process data
-        else: 
-            print("Processing")
-            if self.last_processed[id] - self.shift_size < trace.stats.starttime:
-                self.last_processed[id] = trace.stats.starttime
-            _data = trace.slice(self.last_processed[id]- self.shift_size,
-                                  self.last_processed[id]- self.shift_size + self.data_length)
-            self.last_processed[id] += self.shift_size
-            self.denoise_picker.push(_data)
-        return data
-            
     def _setup_picking(self):
         picker = sbm.EQTransformer.from_pretrained("ethz")
         client = obspy.clients.fdsn.Client("ETH")
-        self.denoise_picker = Denoiser.Denoiser(client, client, "../Models/model_1000k_onlyweights.keras", 
-                                                0.33, debug = True, picker = picker)
-        self.denoise_picker.setup_realtime_processing(no_of_threads=4)
+        self.denoiser  = RealtimeDenoiser.RealtimeDenoiser(0, client, client, "../Models/model_1000k_onlyweights.keras", 
+                                                0.33, picker = picker, debug = True)

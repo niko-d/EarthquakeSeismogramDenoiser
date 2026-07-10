@@ -424,7 +424,7 @@ class Denoiser(object):
         out.data = self.apply_pre_filt(out.data, out.stats.sampling_rate, pre_filt,taper_seconds=taper_seconds)
         return out
     
-    def apply_pre_filt_stream(self, stream):
+    def apply_pre_filt_stream(self, stream, taper_seconds=300):
         """
         Apply pre_filt to every trace in an ObsPy Stream, returns a new Stream.
     
@@ -437,7 +437,7 @@ class Denoiser(object):
         -------
         obspy.Stream  New stream with pre-filtered traces (float64).
         """
-        return Stream([self.apply_pre_filt_trace(tr, self.pre_filt,taper_seconds=self.buffer) for tr in stream])
+        return Stream([self.apply_pre_filt_trace(tr, self.pre_filt,taper_seconds=taper_seconds) for tr in stream])
         
     
     def _fast_remove_response(self, data, inventory):
@@ -753,7 +753,7 @@ class Denoiser(object):
                                       f"{channel}?", starttime, starttime)
 
         # apply filter as in obspy remove_response prefilter & remove any other AA filter
-        data = self.apply_pre_filt_stream(data)
+        data = self.apply_pre_filt_stream(data, self.buffer)
 
         if data[0].stats.sampling_rate % 100 == 0:
             data.decimate(factor=int(data[0].stats.sampling_rate // 100),no_filter=True)
