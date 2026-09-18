@@ -10,6 +10,9 @@ import obspy.realtime.rttrace
 import seisbench.models as sbm
 import obspy.clients.fdsn
 import numpy
+import multiprocessing
+from Denoiser import SENTINEL
+
 
 class Client(obspy.clients.seedlink.easyseedlink.EasySeedLinkClient):
     
@@ -73,14 +76,41 @@ class DataStream(object):
             return None
         return min([trace.stats.endtime for trace in self.stream])
 
+
+def setup_result_processor():
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue(maxsize=256)
+    p = ctx.Process(
+                target=result_processor,
+                args=(queue,),
+            )
+    p.start()
+    print(f"started result processor")
+    return queue
+
+
+def result_processor(queue):
+    print("Pick Result processor running")
+    with open("/tmp/pick-output.txt", "w") as f:
+        while True:
+            content = queue.get()
+            print("Dequeued: ", content)
+            if content is SENTINEL:
+                return
+            f.write(str(content))
+        
+
+
+
+
 class RealtimePicker(object):
     
     def __init__(self, seedlink_address, station_list):
-        self.seedlink_client = Client(seedlink_address, self.process_data)
         self.shift_size = 61.2 / 2
         self._setup_picking()
         self.streams = {}
-        
+        self.seedlink_client = Client(seedlink_address, self.process_data)
+
         for chn in station_list:
             network, station, location, channel = chn.split('.')
             locchannel = f"{location}{channel}"
@@ -110,14 +140,20 @@ class RealtimePicker(object):
             stream = obspy.core.Stream([trace.slice(datastream.next_process, 
                      datastream.next_process + 81.2, nearest_sample=True) 
                      for trace in datastream])
-            self.denoiser.run_realtime(stream)
+            self.queue.put(stream)
+            print(f"Queue length: {self.queue.qsize()}")
             datastream.next_process += self.shift_size
         
 #        else: 
 #            print("Not enough new data")
         
+
     def _setup_picking(self):
-        picker = sbm.EQTransformer.from_pretrained("ethz")
+        #picker = sbm.EQTransformer.from_pretrained("ethz")
         client = obspy.clients.fdsn.Client("ETH")
-        self.denoiser  = RealtimeDenoiser.RealtimeDenoiser(0, client, client, "../Models/model_1000k_onlyweights.keras", 
-                                                0.33, picker = picker, debug = True)
+        inventory = client.get_stations(network="CH",starttime = obspy.core.UTCDateTime(), level = 'response')
+        result_queue = setup_result_processor()
+        self.queue = RealtimeDenoiser.setup_consumers(8, "ETH", "ETH", "../Models/model_1000k_onlyweights.keras", 
+                                                0.33,  eqs2_model_path = "../Models/EQS2.keras", picker = 'ethz',  
+                                                polarity_model_path="../Models/polarity_paper.keras", polarity_kwargs={"threshold": 0.33},
+                                                debug = True, inventory = inventory, res_queue = result_queue, picker_kwargs={'pick_output':'sc3ml'})

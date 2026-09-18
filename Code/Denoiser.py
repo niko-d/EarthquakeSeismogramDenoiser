@@ -9,6 +9,8 @@ import queue
 import tensorflow as tf
 import Picker
 import os
+import obspy.clients.fdsn
+import seisbench.models as sbm
 
 from obspy.signal.invsim import cosine_taper, cosine_sac_taper
 from obspy.signal.util import _npts2nfft
@@ -21,6 +23,9 @@ from tensorflow.keras.layers import Layer
 from sklearn.preprocessing import RobustScaler
 
 tf.config.set_visible_devices([], 'GPU')
+tf.config.threading.set_inter_op_parallelism_threads(1)
+tf.config.threading.set_intra_op_parallelism_threads(1)
+
 _PROGRAM_START = time.perf_counter()
 
 logger = logging.getLogger(__name__)
@@ -155,6 +160,7 @@ class Denoiser(object):
                  model_path, min_peak_height, eqs2_model_path=None,
                  picker=None, picking_kwargs=None,
                  polarity_model_path=None, polarity_kwargs=None,
+                 inventory = None, picker_kwargs=None,
                  debug=False):
         """
         data_client          : obspy client to get data
@@ -178,6 +184,9 @@ class Denoiser(object):
         self.min_peak_height = min_peak_height
         self.data_client = data_client
         self.metadata_client = metadata_client
+        if isinstance(metadata_client, str):
+            self.metadata_client = obspy.clients.fdsn.Client(metadata_client)
+
         self.threshold = 10
         self.buffer = 300
         self.len_sample = 6120
@@ -191,12 +200,14 @@ class Denoiser(object):
         self.one_sample_s = 1.0 / self.stft_parameters["fs"]  # = 0.01s at 100 Hz
         self.realtime_queue = None # set only in realtime use
         self.realtime_mode = False
-
+        self.inventory = inventory
+        
         # t = np.linspace(0, 61.2, 256)  # OLD
         # self.bin_spacing = (255/256) * (t[1]-t[0])  # OLD
         self.bin_spacing = (self.stft_parameters["nperseg"] - self.stft_parameters["noverlap"]) / self.stft_parameters["fs"]  # = 0.24
 
         self.response_cache = {}
+        print("EQS model: ", model_path)
         self.model = tf.keras.models.load_model(model_path, compile=False)
 
         # EQShyb / EQS2
@@ -205,10 +216,17 @@ class Denoiser(object):
             custom_objects={"ReflectPad1D": ReflectPad1D},
             compile=False
         ) if eqs2_model_path else None
+#        self.eqs2_model = None
+        print("EQS2 model path: ", eqs2_model_path)
+        print("Eqs2_model loaded: ", self.eqs2_model)
 
         # PICKER
         self.picker = None
         if picker:
+            if isinstance(picker, str):
+                picker = sbm.EQTransformer.from_pretrained("ethz")
+
+
             self.picker = Picker.Picker(logger, picker, model_path, self.stft_parameters, picking_kwargs, polarity_model_path, polarity_kwargs)
             print("Picker now: ", self.picker)
         self.picking_kwargs = picking_kwargs or {}
@@ -222,6 +240,7 @@ class Denoiser(object):
             custom_objects={"custom>MaxAbsNorm1D": MaxAbsNorm1D},
             compile=False
         ) if polarity_model_path else None
+        self.polarity_model = None
         self.polarity_threshold = (polarity_kwargs or {}).get('threshold', 0.33)
 
 
@@ -301,6 +320,11 @@ class Denoiser(object):
         """
 
         logger.debug("")
+        if self.inventory:
+            inventory = self.inventory.select(network = network, station = station)
+            if inventory and len(inventory) > 0:
+                return inventory
+
         return self.metadata_client.get_stations(network=network,
                                                  station=station, location="*",
                                                  channel="*", level="response")
@@ -322,6 +346,7 @@ class Denoiser(object):
         """
 
         logger.debug("")
+
         inventory = self._query_server(network, station)
         return inventory.select(network, station, location, channel,
                                 starttime, endtime)
@@ -1453,6 +1478,11 @@ class Denoiser(object):
         # OUT: denoised_hyb (np.ndarray, (A, 6120, 3), EQShyb denoised waveforms)
         #      skipped if eqs2_model is None or no accepted detections
         denoised_hyb = None
+        print("parameters: ", stft_final_subset, masks_subset,
+                                              utc_start_subset, data_stack,
+                                              data[0].stats.starttime)
+
+
         if self.eqs2_model is not None and stft_final_subset.shape[0] > 0:
             denoised_hyb = self._apply_eqshyb(stft_final_subset, masks_subset,
                                               utc_start_subset, data_stack,
@@ -1512,21 +1542,21 @@ class Denoiser(object):
                               trace.stats.network, trace.stats.station, 
                               trace.stats.location, trace.stats.channel))
     
-    def setup_realtime_processing(self, no_of_threads = 4):
-        self.realtime_queue = queue.Queue(maxsize=256)
-        self.realtime_mode = True
-        self._workers = []
-        
-        for i in range(no_of_threads):
-            t = threading.Thread(
-                args=(self.realtime_queue,),
-                target=self._consumer_thread,
-                name=f"consumer-{i}",
-                daemon=True
-                )
-            t.start()
-            self._workers.append(t)
-        pass
+#    def setup_realtime_processing(self, no_of_threads = 4):
+#        self.realtime_queue = queue.Queue(maxsize=256)
+#        self.realtime_mode = True
+#        self._workers = []
+#        
+#        for i in range(no_of_threads):
+#            t = threading.Thread(
+#                args=(self.realtime_queue,),
+#                target=self._consumer_thread,
+#                name=f"consumer-{i}",
+#                daemon=True
+#                )
+ #           t.start()
+  #          self._workers.append(t)
+#        pass
     
     
 

@@ -7,8 +7,11 @@ import os
 import json
 import tensorflow as tf
 from Common import MaxAbsNorm1D
+import logging
 
-
+logger = logging.getLogger(__name__)
+tf.config.threading.set_inter_op_parallelism_threads(1)
+tf.config.threading.set_intra_op_parallelism_threads(1)
 
 def check_dir(_dir):
     if not os.path.exists(_dir):
@@ -42,15 +45,14 @@ def _predict_polarity_tta(
         probabilities    : np.ndarray shape (3,), mean softmax over TTA batch
         all_predictions  : np.ndarray shape (repeat, 3), per-repetition softmax
     """
+    logger.debug("")
     labels = np.array(["negative", "undecidable", "positive"])
-
+    print("======== polarity_model is: ", polarity_model)
     p_idx = int(round((p_pick - z_starttime) * z_sampling_rate))
     half  = win // 2
 
     batch = []
     for tr in z_tta_collection.select(component='Z'):
-        fig = tr.plot(show=False)
-        fig.savefig(f"/tmp/{tr.id}-{tr.stats.starttime}.png")
         z = np.asarray(tr.data, dtype=np.float32)
         z_win = np.zeros(win, dtype=np.float32)
         start = p_idx - half
@@ -67,7 +69,7 @@ def _predict_polarity_tta(
     if polarity_model.input_shape[-1] == 1:
         z_batch = z_batch[:, :, np.newaxis]                              # (repeat, win, 1)
 
-    pred      = polarity_model(z_batch, training=True).numpy()           # (repeat, 3)
+    pred      = polarity_model({'waveform': z_batch}, training=True).numpy()           # (repeat, 3)
     mean_pred = pred.mean(axis=0)                                        # (3,)
 
     label = labels[np.argmax(mean_pred)]
@@ -86,8 +88,10 @@ def _predict_polarity_tta(
 class Picker(object):
     
     def __init__(self, logger, picker, model_name, stft_parameters, picking_kwargs=None,
-                 polarity_model_path=None, polarity_kwargs=None, ):
-        
+                 polarity_model_path=None, polarity_kwargs=None, pick_output="json" ):
+        logger = logger
+        logger.debug("")
+        print("Picker started")
         # PICKER
         self.picker = picker
         print("Picker set to: ", picker)
@@ -97,7 +101,9 @@ class Picker(object):
             's_picks': {'scale_sample': 4*2.211, 'offset_sample': 3.600},
         }
         self.stft_parameters = stft_parameters
+        self.pick_output = pick_output
         
+        print("Path is: ", polarity_model_path)        
         # POLARITY
         self.polarity_model = tf.keras.models.load_model(
             polarity_model_path,
@@ -106,7 +112,7 @@ class Picker(object):
         ) if polarity_model_path else None
         self.polarity_threshold = (polarity_kwargs or {}).get('threshold', 0.33)
         self.components = None
-        self.logger = logger
+        logger = logger
         self.model_name = model_name
         
     def _weighted_std(self, values, weights):
@@ -119,6 +125,7 @@ class Picker(object):
         Returns : float, weighted standard deviation
         """
 
+        logger.debug("")
         
         w = weights + 1e-30
         
@@ -138,6 +145,8 @@ class Picker(object):
         max_values    : 1D array-like, confidence weights
         Returns       : float, weighted median pick time
         """
+        logger.debug("")
+
         argmax_values = np.asarray(argmax_values)
         max_values = np.asarray(max_values)
         sorted_indices = np.argsort(argmax_values)
@@ -161,6 +170,8 @@ class Picker(object):
             medians  : list of weighted median times, one per cluster
             clusters : list of lists of raw pick times per cluster
         """
+        logger.debug("")
+
         sorted_indices = np.argsort(pick_array)
         sorted_picks = pick_array[sorted_indices]
         diffs = np.diff(sorted_picks)
@@ -187,6 +198,8 @@ class Picker(object):
             uncertainty            : float, 1 + weighted std of argmax positions
             fraction_above_confidence : float, fraction of TTA traces above threshold
         """
+        logger.debug("")
+
         t_start = pick_utc - pick_tolerance
         t_end = pick_utc + pick_tolerance
         sliced_traces = [
@@ -218,6 +231,8 @@ class Picker(object):
             picks_median_utc : list of UTCDateTime, one per cluster
             results          : list of (uncertainty, fraction_above_confidence) tuples
         """
+        logger.debug("")
+
         if len(peak_times) == 0:
             return [], []
         picks_median, _ = self._cluster_picks(peak_times, peak_vals,
@@ -246,6 +261,8 @@ class Picker(object):
         white_noise_factor: float, global scaling of injected noise amplitude
         Returns           : obspy.Stream, augmented event stream
         """
+        logger.debug("")
+
         _event_noiseinjected = _event_stream.copy()
         # seed by id — same id always produces same noise sequence
         rng = np.random.default_rng(seed=id)
@@ -271,13 +288,15 @@ class Picker(object):
         Returns            : obspy.Stream, noise traces (3 components),
                              or empty Stream on component/trace-count mismatch
         """
+        logger.debug("")
+
         missing_orig = [c for c in self.components if len(_original.select(component=c)) == 0]
         missing_denoised = [c for c in self.components if len(_denoised_snippets.select(component=c)) == 0]
         missing = missing_orig + missing_denoised
 
 
         if missing:
-            self.logger.warning(f"_get_designaled_noise: missing components {missing} "
+            logger.warning(f"_get_designaled_noise: missing components {missing} "
                            f"(orig channels: {[tr.stats.channel for tr in _original]}, "
                            f"self.components: {self.components}) — returning empty stream")
             return obspy.core.Stream()
@@ -289,7 +308,7 @@ class Picker(object):
 
             # guard: exactly 1 trace per component expected (snippet, not continuous)
             if len(orig_comp) != 1 or len(denoised_comp) != 1:
-                self.logger.warning(f"_get_designaled_noise: expected 1 trace per component, "
+                logger.warning(f"_get_designaled_noise: expected 1 trace per component, "
                                f"got {len(orig_comp)} original and "
                                f"{len(denoised_comp)} denoised for component {comp} "
                                f"— merge inputs before calling")
@@ -303,7 +322,7 @@ class Picker(object):
             if n_orig != n_denoised:
                 # last-resort truncation — caller should have aligned lengths
                 n = min(n_orig, n_denoised)
-                self.logger.warning(f"_get_designaled_noise: length mismatch on "
+                logger.warning(f"_get_designaled_noise: length mismatch on "
                                f"component {comp} ({n_orig} vs {n_denoised}) "
                                f"— truncating to {n} samples")
                 orig_data = tr_orig.data[:n]
@@ -340,6 +359,8 @@ class Picker(object):
                          **P picks additionally carry a polarity dict as fifth**
                          **element when self.polarity_model is not None.**
         """
+        logger.debug("")
+
         _st_z, _st_1, _st_2 = event_streams
 
         add = 5 if _st_z.stats.npts >= 6120 else 5 + (6120 - _st_z.stats.npts) / 200
@@ -396,6 +417,9 @@ class Picker(object):
             entry = (p_median, p_result[0], p_result[1], event_id)
             # **if polarity model configured on self, append polarity dict**
             if self.polarity_model is not None:
+                logger.debug("polarity")
+                
+                logger.debug("polarity picker running")
                 polarity = _predict_polarity_tta(
                     z_tta_collection=event_tta_collection,
                     z_starttime=_st_z.stats.starttime,
@@ -404,6 +428,8 @@ class Picker(object):
                     polarity_model=self.polarity_model,
                     threshold=self.polarity_threshold,
                 )
+                logger.debug("polarity done")
+
                 entry = entry + (polarity,)
             p_picks.append(entry)
 
@@ -432,6 +458,8 @@ class Picker(object):
         min_share_models : float, min fraction of TTA reps above threshold
         Returns          : dict with keys 'p_picks' and 's_picks'
         """
+        logger.debug("")
+
         all_results = {'p_picks': [], 's_picks': []}
 
         # sort both streams by starttime so Z/N/E triples zip correctly
@@ -455,23 +483,39 @@ class Picker(object):
             f"{len(designaled_streams_list)} designaled streams"
         )
 
-        with ThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(
-                    self._process_snippet,
-                    event_streams,
-                    designaled_stream,
-                    repeat, pick_tolerance,
-                    p_confidence, s_confidence
-                )
-                # for event_streams in event_streams_list
-                for event_streams, designaled_stream in zip(event_streams_list, designaled_streams_list)
-            ]
-            # for future in futures:
-            for future in as_completed(futures):  # should be fine here
-                result = future.result()
-                all_results['p_picks'].extend(result['p_picks'])
-                all_results['s_picks'].extend(result['s_picks'])
+        #with ThreadPoolExecutor(max_workers=1) as executor:
+        #    futures = [
+        #        executor.submit(
+        #            self._process_snippet,
+        #            event_streams,
+        #            designaled_stream,
+        #            repeat, pick_tolerance,
+        #            p_confidence, s_confidence
+        #        )
+        #        # for event_streams in event_streams_list
+        #        for event_streams, designaled_stream in zip(event_streams_list, designaled_streams_list)
+        #    ]
+        #    # for future in futures:
+        #    for future in as_completed(futures):  # should be fine here
+        #        result = future.result()
+        #        all_results['p_picks'].extend(result['p_picks'])
+        #        all_results['s_picks'].extend(result['s_picks'])
+
+        for event_streams, designaled_stream in zip(
+            event_streams_list,
+            designaled_streams_list):
+ 
+            result = self._process_snippet(
+                event_streams,
+                designaled_stream,
+                repeat,
+                pick_tolerance,
+                p_confidence,
+                s_confidence,
+            )
+ 
+        all_results['p_picks'].extend(result['p_picks'])
+        all_results['s_picks'].extend(result['s_picks'])
 
         # filter by minimum share of TTA models above confidence threshold
         all_results['p_picks'] = [e for e in all_results['p_picks']
@@ -499,13 +543,15 @@ class Picker(object):
         Returns dict with keys 'p_picks' and 's_picks', each a list of tuples:
             (median pick time, uncertainty, fraction above confidence, event_id)
         """
-        # self.logger.debug(f"_pick: data_original has {len(data_original)} traces: "
+        # logger.debug(f"_pick: data_original has {len(data_original)} traces: "
         #              f"{[tr.stats.channel for tr in data_original]}")
 
         self.components = components
+
+        logger.debug("")
         
         if not len(trimmed_streams):
-            self.logger.info("No denoised snippets — skipping picking")
+            logger.info("No denoised snippets — skipping picking")
             return {'p_picks': [], 's_picks': []}
 
         data_start = data_original[0].stats.starttime
@@ -516,13 +562,13 @@ class Picker(object):
 
         for i in range(num_detections):
             snippet = trimmed_streams[3 * i: 3 * (i + 1)]
-            # self.logger.debug(f"Detection {i}: snippet components = "
+            # logger.debug(f"Detection {i}: snippet components = "
             #              f"{[tr.stats.channel for tr in snippet]}, "
             #              f"npts = {[tr.stats.npts for tr in snippet]}")
 
             tr_ref = snippet.select(component=self.components[0])[0]
             if tr_ref.stats.npts == 0:  # TODO check why this happens
-                self.logger.warning(f"Detection {i}: zero-length snippet — skipping")
+                logger.warning(f"Detection {i}: zero-length snippet — skipping")
                 continue
 
             # start = tr_ref.stats.starttime
@@ -536,7 +582,7 @@ class Picker(object):
 
             for tr in data_original:
                 tr_sliced = tr.slice(start, end)
-                # self.logger.debug(f"_pick slice: tr={tr.id} "
+                # logger.debug(f"_pick slice: tr={tr.id} "
                 #              f"data={tr.stats.starttime}—{tr.stats.endtime} "
                 #              f"slice={start}—{end} "
                 #              f"result_npts={tr_sliced.stats.npts} "
@@ -550,12 +596,12 @@ class Picker(object):
                     )
                 original_snippet += tr_sliced
 
-            # self.logger.warning(f"snippet:{snippet[0].stats.starttime} — {snippet[0].stats.endtime}")
-            # self.logger.warning(f"original_snippet: {original_snippet[0].stats.starttime} — {original_snippet[0].stats.endtime}")
+            # logger.warning(f"snippet:{snippet[0].stats.starttime} — {snippet[0].stats.endtime}")
+            # logger.warning(f"original_snippet: {original_snippet[0].stats.starttime} — {original_snippet[0].stats.endtime}")
 
             noise_snippet = self._get_designaled_noise(snippet, original_snippet)
             if len(noise_snippet) == 0:
-                self.logger.warning(f"Detection {i}: _get_designaled_noise failed — "
+                logger.warning(f"Detection {i}: _get_designaled_noise failed — "
                                f"using zero noise for this snippet")
                 # zero-fill to preserve index alignment with trimmed_streams
                 for tr in snippet:
@@ -570,76 +616,87 @@ class Picker(object):
             st_designaled=st_designaled_snippets,
             **self.picking_kwargs
         )
-        self.logger.info(f"Picks: {len(picks['p_picks'])} P, "
+        logger.info(f"Picks: {len(picks['p_picks'])} P, "
                     f"{len(picks['s_picks'])} S")
         return picks
 
 
-    def _save_picks(self, picks, starttime, plot = False, traces = False, orig_data = None):
+    def _save_picks(self, picks, starttime, stream_id=None):
         """
-        Save picks to JSON alongside MiniSEED output.
-        Format: {"p_picks": [{"time": ..., "uncertainty": ...,
-                               "share": ..., "id": ...,
-                               "polarity": ..., "polarity_probabilities": ...}, ...],
-                 "s_picks": [...]}
+        Save picks alongside the MiniSEED output. Format(s) controlled by
+        self.pick_output ("json" | "sc3ml" | "both").
 
-        picks     : dict from _pick(), keys 'p_picks' and 's_picks'
-                    P pick tuples are (time, uncertainty, share, id) or
-                    (time, uncertainty, share, id, polarity_dict) when
-                    polarity model is configured.
-        starttime : UTCDateTime, used for output directory naming (same as _output)
+        "polarity" and "polarity_probabilities" are present only when a polarity
+        model is configured (Pick.polarity is not None); S picks never carry polarity.
+
+        SC3ML layout: one Catalog holding one Event with all P and S picks,
+        built by _build_catalog().
+
+        Uncertainty is scaled from raw TTA sample-domain std to seconds by
+        _scale_uncertainty() — applied exactly once, in both output paths.
+
+        picks     : dict with keys 'p_picks' and 's_picks', each a list of Pick
+                    objects as produced by _pick().
+        starttime : obspy.UTCDateTime, used for output directory naming (DOYxxx),
+                    must match the starttime passed to _output().
+        stream_id : str or None, stream identifier without component character,
+                    e.g. "CH.SEMOS..HG". When None, derived from the first
+                    available pick's event_id by stripping the trailing component
+                    character (event_id[:-1]).
         """
-        dir_tmp = str(Path(self.model_name).parent /
-                      ("DOY" + str(starttime.julday).zfill(3))) + "/"
+        dir_tmp = "/tmp/"
         check_dir(dir_tmp)
 
-        serialisable = {}
-        for phase, pick_list in picks.items():
-            entries = []
-            for pick in pick_list:
-                t, u, s, eid = pick[:4]
+        # ======== {'p_picks': [(UTCDateTime(2026, 8, 11, 15, 14, 1, 655000), np.float64(8.105067689497456), np.float64(0.85), 'CH.ROMAN.SF.HGZ', {'label': np.str_('undecidable'), 'probabilities': array([0.07505629, 0.8264154 , 0.09852834], dtype=float32), 'all_predictions': array([[0.09442341, 0.8154424 , 0.09013423],
 
-                # scale raw TTA std to physically meaningful seconds;
-                # coefficients derived from empirical calibration against reference picks
-                coeff = self.uncertainty_scaling[phase]
-                uncertainty_scaled = (coeff['scale_sample'] * u + coeff['offset_sample']) / self.stft_parameters["fs"]
+        if True:
+            serialisable = {}
+            for _phase in ('p_picks','s_picks'):
+                if _phase == 'p_picks':
+                    phase = 'P'
+                else:
+                    phase = 'S'
+                for pick in picks[_phase]:
+                    print("==========>", pick)
+                    if len(pick) == 5:
+                        _time, _, _, id, pickdict = pick
+                        polarity = pickdict['label']
 
-                entry = {"time": str(t), "uncertainty": uncertainty_scaled, "share": s, "id": eid}
-                # No polarity so far
-                
-                if traces and plot:
-                    for trace in traces:
-                        print(trace.id, eid, trace.stats.starttime, trace.stats.endtime, t)
-                        if trace.id == eid and trace.stats.starttime <= t and trace.stats.endtime >= t and orig_data:
-                            data = orig_data.copy()
-                            data = data.select(id=trace.id)
-                            print(data)
-                            data.trim(trace.stats.starttime, trace.stats.endtime)
-                            print(data)
-                            data[0].stats.channel = 'CPY'
-                            
-                            stream = obspy.core.Stream([trace, data[0]])
-                            fig = stream.plot(show=False)
-                            
-                            #trace.plot(show=False)
-                            for ax in fig.axes:
-                                color = 'g'
-                                if 's_' in phase or 'S_' in phase:
-                                    color='b'
-                                ax.axvline(t, color=color, linewidth=2)
-                            fig.savefig(f"/tmp/{trace.id}-{str(t)}.png")
-                            break
+                    elif len(pick) == 4:
+                        _time, _, _, id = pick
+                        polarity = None
+                    else:
+                        print("XXXX======> Cannot unpack: ")
+                        print(pick)
+                        continue
+                    print('====>', _time, id, phase, polarity)
+        
+        return
+        if self.pick_output in ("json", "both"):
+        
+            for phase, pick_list in picks.items():
+                entries = []
+                for pick in pick_list:
+                    entry = {
+                        "time": str(pick.time),
+                        "uncertainty": self._scale_uncertainty(pick, phase),
+                        "share": pick.share,
+                        "id": pick.event_id,
+                    }
+                    if pick.polarity is not None:
+                        entry["polarity"] = pick.polarity["label"]
+                        entry["polarity_probabilities"] = pick.polarity["probabilities"].tolist()
+                    entries.append(entry)
+                serialisable[phase] = entries
 
-                # polarity dict present as fifth element for P picks
-                if len(pick) == 5:
-                    polarity = pick[4]
-                    entry["polarity"] = polarity["label"]
-                    entry["polarity_probabilities"] = polarity["probabilities"].tolist()
-                    # entry["polarity_all_predictions"] = polarity["all_predictions"].tolist()
-                entries.append(entry)
-            serialisable[phase] = entries
+            out_path = dir_tmp + "pick_output" + ".json"
+            with open(out_path, "w") as f:
+                json.dump(serialisable, f, indent=2)
+            logger.info(f"Picks written to {out_path}")
 
-        out_path = dir_tmp + f"picks_DOY{str(starttime.julday).zfill(3)}.json"
-        with open(out_path, "w") as f:
-            json.dump(serialisable, f, indent=2)
-        self.logger.info(f"Picks written to {out_path}")
+        if self.pick_output in ("sc3ml", "both"):
+            out_path = dir_tmp + "pick_output" + ".xml"
+            self._build_catalog(picks).write(out_path, "SC3ML")
+            logger.info(f"Pick catalog written to {out_path}")
+            
+            
