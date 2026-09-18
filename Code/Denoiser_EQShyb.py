@@ -19,6 +19,13 @@ from scipy.signal import istft
 from obspy.signal.util import _npts2nfft
 from obspy import Stream, Trace  # NEW: used in _stream_tta()
 from concurrent.futures import ThreadPoolExecutor, as_completed  # NEW: used in _process_picks()
+#################NEW#######################################
+from obspy.core.event import Catalog, Comment
+from obspy.core.event.origin import Pick as ObsPyPick   # aliased: `Pick` is the local dataclass
+from obspy.core.event.base import WaveformStreamID, QuantityError
+from obspy.core.event.event import Event
+from obspy.core.event.header import EvaluationMode
+#################NEW#######################################
 tf.config.set_visible_devices([], 'GPU')
 _PROGRAM_START = time.perf_counter()
 
@@ -35,9 +42,20 @@ SENTINEL = object()
 #    _predict_polarity_tta()   ← TTA polarity prediction on Z component batch
 #    setup_logging()           ← configure relative-time logging handler
 #
+# ─── Module-level definitions ─────────────────────────────────────────────────
+#
+#  Functions (module-level):
+#    apply_pre_filt()          ← zero-mean, cosine taper, FFT, cosine_sac_taper, IFFT
+#    apply_pre_filt_trace()    ← apply pre-filter to a single trace
+#    apply_pre_filt_stream()   ← apply pre-filter to all traces in a stream
+#    _predict_polarity_tta()   ← TTA polarity prediction on Z component batch
+#    setup_logging()           ← configure relative-time logging handler
+#
 #  Classes (module-level):
 #    Pick                      ← dataclass: accepted phase pick (time, uncertainty,
 #                                           share, event_id, polarity)
+#    ObsPyPick                 ← alias for obspy.core.event.origin.Pick, to avoid
+#                                collision with the local Pick dataclass above
 #    MaxAbsNorm1D              ← Keras layer: per-channel max-abs normalisation
 #                                (used by polarity model)
 #    ReflectPad1D              ← Keras layer: reflect padding 1D
@@ -96,7 +114,13 @@ SENTINEL = object()
 #  |              |    └── _tta_uncertainty()      ← timing spread across TTA reps
 #  |              |         └── _weighted_std()   ← confidence-weighted std
 #  |              └── _predict_polarity_tta()      ← optional, per accepted P pick; reuses TTA Z collection
-#  ├── _save_picks()                    ← serialise Pick objects, scale uncertainties, write picks JSON to disk (same DOY directory)
+#  ├── _save_picks()                    ← serialise Pick objects; writes JSON and/or SC3ML to disk
+#  |    |                                 (same DOY directory), per self.pick_output
+#  |    ├── _scale_uncertainty()       ← raw TTA sample-domain std → seconds (applied once,
+#  |    |                                 shared by both output paths)
+#  |    └── _build_catalog()           ← optional, only if pick_output includes "sc3ml";
+#  |         |                            obspy Catalog: one Event holding all P/S picks
+#  |         └── _scale_uncertainty()  ← re-uses the same calibrated scaling
 #  ├── _filter_streams_by_picks()       ← optional, only if filter_by_pick enabled; keep detections with P or S pick
 #  └── _output()                        ← zero-fill gaps, write MiniSEED to disk
 def apply_pre_filt(data, samp_rate, pre_filt,taper_seconds=300):
@@ -239,7 +263,7 @@ class Pick:
 
     time        : obspy.UTCDateTime, pick time
     uncertainty : float, weighted std of TTA argmax positions (raw sample units;
-                  scaled to seconds in _save_picks via uncertainty_scaling)
+                  scaled to seconds by _scale_uncertainty() via uncertainty_scaling)
     share       : float, fraction of TTA repetitions whose peak confidence
                   exceeded the phase confidence threshold
     event_id    : str, trace id of the Z component (e.g. "CH.SEMOS..HGZ")
@@ -342,7 +366,7 @@ class Denoiser(object):
                  model_path, min_peak_height, eqs2_model_path=None,
                  picker=None, picking_kwargs=None,
                  polarity_model_path=None, polarity_kwargs=None,
-                 filter_by_pick=False,debug=False):
+                 filter_by_pick=False,pick_output="json", debug=False):
         """
         data_client          : obspy client to get data
         metadata_client      : obspy client to get metadata
@@ -360,8 +384,13 @@ class Denoiser(object):
                                winning class probability to accept a polarity
                                label, below which 'undecidable' is returned
         filter_by_pick       : optional bool (default False); if True, only detections
-                                   with at least one P or S pick are written to MiniSEED;
-                                   requires picker to be set, otherwise has no effect
+                               with at least one P or S pick are written to MiniSEED;
+                               requires picker to be set, otherwise has no effect
+        pick_output          : optional str (default "json"); pick output format —
+                               "json"  : picks JSON only
+                               "sc3ml" : obspy Catalog written as SC3ML only
+                               "both"  : both files, same stem, .json and .xml
+                               Has no effect if picker is None.
         debug                : enable verbose logging
         """
 
@@ -376,7 +405,7 @@ class Denoiser(object):
         self.model_name = model_path  # path to EQS model, reused for output directory naming
         self.pre_filt = [1 / 100, 1 / 20, 45, 50]   # bandpass corners (Hz) for cosine taper pre-filter
         self.stft_parameters = {"nperseg": 48, "nfft": 126, "fs": 100,"noverlap": 24}
-        self.REALIGN_SCORE_TOLERANCE = 1 # 0.5 # NEW added
+        self.REALIGN_SCORE_TOLERANCE = 1#0.5#1 # 0.5 # NEW added
         self.signal_buffer_s = 3.0  # buffer to start save denoised stream with at least 3s before signal start (ideally)
         self.one_sample_s = 1.0 / self.stft_parameters["fs"]  # = 0.01s at 100 Hz
 
@@ -417,8 +446,14 @@ class Denoiser(object):
         self.filter_by_pick = filter_by_pick  # if True, only write MiniSEED for detections with a P or S pick
         self.components = None  # set in _get_data()
 
+        # pick_output : "json" | "sc3ml" | "both"
+        if pick_output not in ("json", "sc3ml", "both"):
+            raise ValueError(f"pick_output must be 'json', 'sc3ml' or 'both', got {pick_output!r}")
+        self.pick_output = pick_output
+
         setup_logging(debug=debug)
         logger.debug("")
+
 
     def _loader_thread(self, startday, endday, network, station, location,
                        channel, output_queue):
@@ -1804,8 +1839,8 @@ class Denoiser(object):
             Only in memory (not saved to disk). Used only to compute
             per-snippet noise via (original - denoised).
 
-        Returns dict with keys 'p_picks' and 's_picks', each a list of tuples:
-            (median pick time, uncertainty, fraction above confidence, event_id)
+        Returns dict with keys 'p_picks' and 's_picks', each a list of Pick
+                objects (time, uncertainty, share, event_id, polarity).
         """
         # logger.debug(f"_pick: data_original has {len(data_original)} traces: "
         #              f"{[tr.stats.channel for tr in data_original]}")
@@ -1882,19 +1917,17 @@ class Denoiser(object):
 
     def _save_picks(self, picks, starttime, stream_id=None):
         """
-        Save picks to a JSON file alongside the MiniSEED output.
+        Save picks alongside the MiniSEED output. Format(s) controlled by
+        self.pick_output ("json" | "sc3ml" | "both").
 
-        Output format:
-            {
-              "p_picks": [{"time": ..., "uncertainty": ..., "share": ..., "id": ...,
-                           "polarity": ..., "polarity_probabilities": ...}, ...],
-              "s_picks": [{"time": ..., "uncertainty": ..., "share": ..., "id": ...}, ...]
-            }
         "polarity" and "polarity_probabilities" are present only when a polarity
         model is configured (Pick.polarity is not None); S picks never carry polarity.
 
-        Uncertainty is scaled from raw TTA sample-domain std to seconds using
-        empirical calibration coefficients in self.uncertainty_scaling.
+        SC3ML layout: one Catalog holding one Event with all P and S picks,
+        built by _build_catalog().
+
+        Uncertainty is scaled from raw TTA sample-domain std to seconds by
+        _scale_uncertainty() — applied exactly once, in both output paths.
 
         picks     : dict with keys 'p_picks' and 's_picks', each a list of Pick
                     objects as produced by _pick().
@@ -1909,36 +1942,38 @@ class Denoiser(object):
                       ("DOY" + str(starttime.julday).zfill(3))) + "/"
         check_dir(dir_tmp)
 
-        serialisable = {}
-        for phase, pick_list in picks.items():
-            entries = []
-            for pick in pick_list:
-                coeff = self.uncertainty_scaling[phase]
-                uncertainty_scaled = (coeff['scale_sample'] * pick.uncertainty + coeff['offset_sample']
-                                     ) / self.stft_parameters["fs"]
-
-                entry = {
-                    "time": str(pick.time),
-                    "uncertainty": uncertainty_scaled,
-                    "share": pick.share,
-                    "id": pick.event_id,
-                }
-                if pick.polarity is not None:
-                    entry["polarity"] = pick.polarity["label"]
-                    entry["polarity_probabilities"] = pick.polarity["probabilities"].tolist()
-                entries.append(entry)
-            serialisable[phase] = entries
-
         if stream_id is None:
             first = (picks['p_picks'] or picks['s_picks'] or [None])[0]
-            station_id = first.event_id[:-1] if first else "unknown"
-            out_path = dir_tmp + f"picks_{station_id}_DOY{str(starttime.julday).zfill(3)}.json"
-        else:
-            out_path = dir_tmp + f"picks_{stream_id}_DOY{str(starttime.julday).zfill(3)}.json"
+            stream_id = first.event_id[:-1] if first else "unknown"
 
-        with open(out_path, "w") as f:
-            json.dump(serialisable, f, indent=2)
-        logger.info(f"Picks written to {out_path}")
+        stem = f"picks_{stream_id}_DOY{str(starttime.julday).zfill(3)}"
+
+        if self.pick_output in ("json", "both"):
+            serialisable = {}
+            for phase, pick_list in picks.items():
+                entries = []
+                for pick in pick_list:
+                    entry = {
+                        "time": str(pick.time),
+                        "uncertainty": self._scale_uncertainty(pick, phase),
+                        "share": pick.share,
+                        "id": pick.event_id,
+                    }
+                    if pick.polarity is not None:
+                        entry["polarity"] = pick.polarity["label"]
+                        entry["polarity_probabilities"] = pick.polarity["probabilities"].tolist()
+                    entries.append(entry)
+                serialisable[phase] = entries
+
+            out_path = dir_tmp + stem + ".json"
+            with open(out_path, "w") as f:
+                json.dump(serialisable, f, indent=2)
+            logger.info(f"Picks written to {out_path}")
+
+        if self.pick_output in ("sc3ml", "both"):
+            out_path = dir_tmp + stem + ".xml"
+            self._build_catalog(picks).write(out_path, "SC3ML")
+            logger.info(f"Pick catalog written to {out_path}")
 
     def _filter_streams_by_picks(self, trimmed_streams, picks):
         """
@@ -1969,7 +2004,70 @@ class Denoiser(object):
     # =========================================================================
     # END picking methods
     # =========================================================================
+    ################NEW########################3
+    def _scale_uncertainty(self, pick, phase):
+        """
+        Convert raw TTA sample-domain std to seconds using the empirical
+        calibration in self.uncertainty_scaling. Called once per pick;
+        both the JSON and SC3ML writers consume the result.
 
+        pick  : Pick, as produced by _pick()
+        phase : str, 'p_picks' or 's_picks'
+        Returns : float, timing uncertainty in seconds
+        """
+        coeff = self.uncertainty_scaling[phase]
+        return (coeff['scale_sample'] * pick.uncertainty
+                + coeff['offset_sample']) / self.stft_parameters["fs"]
+
+    def _build_catalog(self, picks):
+        """
+        Build an obspy Catalog holding a single Event with all P and S picks.
+
+        Uncertainty is taken from _scale_uncertainty() — already calibrated,
+        applied symmetrically as lower/upper. `share` is carried as
+        confidence_level (in percent). Polarity, when a polarity model is
+        configured, maps directly onto ObsPy's Pick.polarity vocabulary
+        ('positive' | 'negative' | 'undecidable'); the softmax vector is
+        attached as a Comment since it has no native field.
+
+        picks   : dict with keys 'p_picks' / 's_picks', lists of Pick objects
+        Returns : obspy.core.event.Catalog
+        """
+        event_picks = []
+        for phase, hint in (('p_picks', 'P'), ('s_picks', 'S')):
+            for p in picks[phase]:
+                code = p.event_id.split(".")
+                if len(code) == 4:
+                    net, sta, loc, cha = code
+                elif len(code) == 3:
+                    net, sta, loc = code
+                    cha = ""
+                else:
+                    logger.warning(f"_build_catalog: unparsable event_id {p.event_id!r} — skipping pick")
+                    continue
+
+                unc = self._scale_uncertainty(p, phase)
+                obspy_pick = ObsPyPick(
+                    time=p.time,
+                    waveform_id=WaveformStreamID(network_code=net, station_code=sta,
+                                                 location_code=loc, channel_code=cha),
+                    phase_hint=hint,
+                    evaluation_mode=EvaluationMode("manual"),
+                    time_errors=QuantityError(lower_uncertainty=unc,
+                                              upper_uncertainty=unc,
+                                              confidence_level=p.share * 100),
+                )
+                if p.polarity is not None:
+                    obspy_pick.polarity = p.polarity["label"]
+                    obspy_pick.comments.append(Comment(
+                        text="polarity_probabilities="
+                             + json.dumps(p.polarity["probabilities"].tolist())))
+                event_picks.append(obspy_pick)
+
+        cat = Catalog()
+        cat.append(Event(event_type="earthquake", picks=event_picks))
+        return cat
+    ################NEW########################3
 
     def run_timerange(self, network, station, location, channel,
                       startday, endday):
@@ -2015,7 +2113,8 @@ class Denoiser(object):
         Fetches and restitutes waveforms, computes STFTs, runs the EQS
         in two passes (detection + re-aligned refinement), optionally applies
         the EQShyb time-domain model, assembles denoised streams, writes
-        MiniSEED to disk, and optionally runs TTA phase picking.
+        MiniSEED to disk, and optionally runs TTA phase picking with pick
+                output as JSON and/or SC3ML (see pick_output).
 
         network   : str, FDSN network code
         station   : str, FDSN station code
@@ -2027,7 +2126,8 @@ class Denoiser(object):
                     adjusted internally to the next exact multiple of 61.2 s
         data      : obspy.Stream or None, pre-fetched raw waveforms;
                     if None, data are fetched via self.data_client
-        Returns   : None — results are written to disk (MiniSEED + picks JSON)
+        Returns   : None — results are written to disk (MiniSEED + picks
+                            JSON and/or SC3ML, see pick_output)
         """
 
         logger.debug("")
@@ -2171,7 +2271,7 @@ class Denoiser(object):
         # IN:  trimmed_streams (obspy.Stream, denoised snippets only),
         #      data (obspy.Stream, original restituted, in memory only — not re-fetched)
         # OUT: picks (dict, keys 'p_picks'/'s_picks', each a list of Pick objects),
-        #      picks written to JSON on disk
+        #      picks written to disk as JSON and/or SC3ML per self.pick_output
         picks = None
         if self.picker is not None and len(trimmed_streams):
             picks = self._pick(trimmed_streams, data)
