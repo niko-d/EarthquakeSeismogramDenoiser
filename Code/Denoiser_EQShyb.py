@@ -6,13 +6,16 @@ import time
 import logging
 import threading
 import queue
-import json                                         # NEW: for _save_picks()
+import json
+# import os# NEW: for _save_picks()
+# import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = ""      # hides GPUs from torch *and* TF
 import tensorflow as tf
 from tensorflow.keras.layers import Layer
 from obspy.signal.invsim import cosine_taper, cosine_sac_taper
 from obspy.signal.util import _npts2nfft
 from functools import cache
-from DenoisingFunctions_public import check_dir, normalize_percentile
+from DenoisingFunctions_public import check_dir#, normalize_percentile
 from scipy.signal import find_peaks
 from pathlib import Path
 from scipy.signal import istft
@@ -25,120 +28,142 @@ from obspy.core.event.origin import Pick as ObsPyPick   # aliased: `Pick` is the
 from obspy.core.event.base import WaveformStreamID, QuantityError
 from obspy.core.event.event import Event
 from obspy.core.event.header import EvaluationMode
+from scipy.fft import rfft as _rfft, irfft as _irfft, next_fast_len # NEW DIFF PREPROCESSING
 #################NEW#######################################
-tf.config.set_visible_devices([], 'GPU')
+# tf.config.set_visible_devices([], 'GPU')  # turns GPU off
 _PROGRAM_START = time.perf_counter()
 
 logger = logging.getLogger(__name__)
-
+logging.getLogger('asyncio').setLevel(logging.WARNING)
 SENTINEL = object()
 
 # ─── Module-level definitions ─────────────────────────────────────────────────
 #
 #  Functions (module-level):
+#    _normalize_stft_channels() ← robust per-channel (median/IQR) normalisation
+#                                 of one (64, 256, 6) STFT window
+#    _predict_polarity_tta()   ← TTA polarity prediction on the Z-component batch
+#    setup_logging()           ← configure relative-time logging handler
+#
+#    LEGACY (defined, no longer called anywhere):
 #    apply_pre_filt()          ← zero-mean, cosine taper, FFT, cosine_sac_taper, IFFT
 #    apply_pre_filt_trace()    ← apply pre-filter to a single trace
 #    apply_pre_filt_stream()   ← apply pre-filter to all traces in a stream
-#    _predict_polarity_tta()   ← TTA polarity prediction on Z component batch
-#    setup_logging()           ← configure relative-time logging handler
-#
-# ─── Module-level definitions ─────────────────────────────────────────────────
-#
-#  Functions (module-level):
-#    apply_pre_filt()          ← zero-mean, cosine taper, FFT, cosine_sac_taper, IFFT
-#    apply_pre_filt_trace()    ← apply pre-filter to a single trace
-#    apply_pre_filt_stream()   ← apply pre-filter to all traces in a stream
-#    _predict_polarity_tta()   ← TTA polarity prediction on Z component batch
-#    setup_logging()           ← configure relative-time logging handler
 #
 #  Classes (module-level):
 #    Pick                      ← dataclass: accepted phase pick (time, uncertainty,
 #                                           share, event_id, polarity)
 #    ObsPyPick                 ← alias for obspy.core.event.origin.Pick, to avoid
 #                                collision with the local Pick dataclass above
-#    MaxAbsNorm1D              ← Keras layer: per-channel max-abs normalisation
-#                                (used by polarity model)
-#    ReflectPad1D              ← Keras layer: reflect padding 1D
-#                                (used by EQShyb model)
+#    MaxAbsNorm1D              ← Tensorflow/Keras layer: per-channel max-abs normalisation
+#                                (custom_objects for the polarity model)
+#    ReflectPad1D              ← Tensorflow/Keras layer: reflect padding 1D
+#                                (custom_objects for the EQShyb model)
 #    RelativeTimeFormatter     ← logging.Formatter subclass: elapsed-time prefix
 #    Denoiser                  ← main class, see call trees below
+#
+# ─── Window / STFT geometry ───────────────────────────────────────────────────
+#
+#    len_sample      = 6120 samples = 61.2 s   → one model window
+#    stft hop        = nperseg - noverlap = 24 samples = 0.24 s = one STFT bin
+#    bins per window = 256                     → model input (64, 256, 6)
+#    shift_samples   = 3072 samples = 128 bins → stride between windows (49.8 %
+#                      overlap).  Must be a multiple of the hop, so that windows
+#                      can be sliced out of one global STFT and so that the
+#                      128-bin even/odd correction (bins_overlap) is exact.
+#
+#    Units: _get_peaks() and everything derived from it (filtered_results columns
+#    0–2, bins_overlap, shift_correction) are BIN INDICES.  Conversion to time is
+#    always "× self.bin_spacing" (0.24 s).  Sample indices are always
+#    "(utc - starttime) × fs".
 #
 # ─── Denoiser call trees ──────────────────────────────────────────────────────
 #
 # run_timerange()                        ← multi-day entry point; producer-consumer pipeline
 #  ├── _loader_thread()                  ← producer: fetch one day per iteration, push to queue
-#  |    └── _round_to_window()          ← snap day end to exact multiple of 61.2 s
-#  └── _consumer_thread()               ← consumer: drain queue, call run_data() per day
-#       └── run_data()                  ← see below
+#  |    └── _round_to_window()           ← snap day end to exact multiple of 61.2 s
+#  └── _consumer_thread()                ← consumer: drain queue, call run_data() per day
+#       └── run_data()                   ← see below
 #
 # run_data()                             ← single-window entry point
-#  ├── _round_to_window()               ← snap endtime to exact multiple of 61.2 s
-#  ├── _get_data()                      ← fetch, gap detection, resample, remove response
-#  |    ├── _get_metadata()            ← load inventory via _query_server (cached)
-#  |    |    └── _query_server()       ← FDSN inventory fetch, cached per network/station
-#  |    ├── apply_pre_filt_stream()    ← apply cosine taper + freq-domain pre-filter to all traces
-#  |    |    └── apply_pre_filt_trace() ← apply pre-filter to a single trace
-#  |    |         └── apply_pre_filt() ← zero-mean, cosine taper, FFT, cosine_sac_taper, IFFT
-#  |    └── _fast_remove_response()    ← cached inverse response, FFT-based correction
-#  |         └── _get_response_parameters() ← compute/cache taper + freq response per npts
-#  ├── _compute_stfts()                 ← sliding window STFT over full time range
-#  |    └── _process_segment()         ← STFT for one 61.2 s window, returns raw + normalised
-#  |         └── normalize_percentile() ← percentile normalisation (DenoisingFunctions_public)
-#  ├── _detect_event_signals()          ← EQS first pass, peak detection on mask timeseries
-#  |    ├── model.predict()            ← EQS mask prediction on all windows
-#  |    ├── _get_mask_timeseries()     ← collapse mask array to even/odd timeseries
-#  |    ├── get_peaks()                ← find peaks with onset/end boundaries (×2: even, odd)
+#  ├── _round_to_window()                ← snap endtime to exact multiple of 61.2 s
+#  ├── _get_data()                       ← fetch, gap detection, restitution, 100 Hz
+#  |    ├── _get_metadata()              ← inventory subset via _query_server (cached)
+#  |    |    └── _query_server()         ← FDSN inventory fetch, cached per network/station
+#  |    └── _preprocess_combined()       ← ONE FFT pass: cosine taper + pre-filt +
+#  |                                        spectral decimation to 100 Hz +
+#  |                                        response removal (evalresp interpolated)
+#  ├── _compute_global_stfts()           ← 3 global STFTs, sliced into overlapping 256-bin windows;
+#  |    |                                   edge bins recomputed to reproduce the
+#  |    |                                   per-window zero padding exactly
+#  |    └── _normalize_stft_channels()   ← robust normalisation per window
+#  ├── _detect_event_signals()           ← EQS first pass, peak detection on mask timeseries
+#  |    ├── model.predict()              ← EQS mask prediction on all windows
+#  |    ├── _get_mask_timeseries()       ← collapse mask array to even/odd timeseries
+#  |    ├── _get_peaks()                  ← peaks with onset/end boundaries (×2: even, odd)
 #  |    └── _compare_arrays_time_overlap() ← merge even/odd detections, keep higher-scoring
-#  ├── _select_data_and_mask()          ← select best STFT window per detection
-#  ├── _recompute_mask()                ← re-align window to estimated signal start
-#  |    └── _process_segment()         ← STFT for re-aligned window
-#  |         └── normalize_percentile() ← percentile normalisation (DenoisingFunctions_public)
-#  ├── model.predict()                  ← EQS second pass on re-aligned windows
-#  ├── _make_final_selection()          ← window scoring/selection; A ≤ D accepted
-#  |    └── get_peaks()                ← peak detection on re-aligned mask timeseries
-#  ├── _apply_eqshyb()                  ← optional, only if eqs2_model loaded and A > 0
-#  |    └── eqs2_model.predict()       ← hybrid model (inputs: noisy + EQS denoised + EQS mask)
-#  ├── _build_streams()                 ← ISTFT + stream assembly, EQS or EQShyb path; sorts by starttime
-#  ├── _filter_close_detections_streams() ← remove near-duplicate detections, keep higher-scoring
-#  ├── _trim_streams()                  ← resolve overlapping detections, apply signal buffer
-#  ├── _pick()                          ← optional, only if picker configured and snippets exist
-#  |    ├── _get_designaled_noise()    ← per-snippet noise = original - denoised
-#  |    └── _process_picks()           ← parallel TTA picking loop (ThreadPoolExecutor); returns list of Pick
-#  |         └── _process_snippet()   ← per-detection: TTA augmentation + phase picking + polarity; returns Pick objects
-#  |              ├── _stream_tta()               ← inject std-scaled white noise, seeded by TTA id
-#  |              ├── picker.annotate()            ← SeisBench batch annotation
-#  |              ├── picker.classify_aggregate()  ← aggregate TTA picks
-#  |              ├── _process_peak_times()        ← cluster picks + uncertainty per phase
-#  |              |    ├── _cluster_picks()        ← group nearby picks, one per cluster
+#  ├── _select_data_and_mask()           ← STFT window per detection; returns the
+#  |                                        surviving filtered_results rows ("kept")
+#  ├── _recompute_mask()                 ← re-align window to estimated signal start
+#  |    └── _process_segment()           ← STFT + normalisation for one re-aligned window
+#  |         └── _normalize_stft_channels()
+#  ├── model.predict()                   ← EQS second pass on re-aligned windows
+#  ├── _make_final_selection()           ← window scoring/selection; A ≤ D accepted
+#  |    └── _get_peaks()                  ← peaks on the re-aligned mask timeseries
+#  ├── _apply_eqshyb()                   ← optional, only if eqs2_model loaded and A > 0
+#  |    └── eqs2_model.predict()         ← hybrid model (noisy + EQS denoised + EQS mask)
+#  ├── _build_streams()                  ← ISTFT + stream assembly, EQS or EQShyb path;
+#  |                                        sorted by signal start
+#  ├── _filter_close_detections_streams() ← drop near-duplicate detections, keep best
+#  ├── _trim_streams()                   ← resolve overlapping snippets, apply signal buffer
+#  ├── _pick()                           ← optional, only if picker configured
+#  |    ├── _get_designaled_noise()      ← per-snippet noise = original - denoised
+#  |    └── _process_picks()             ← parallel picking over (snippet, noise) jobs
+#  |         └── _process_snippet()      ← per-detection: TTA + phase picking + polarity
+#  |              ├── _stream_tta()               ← inject std-scaled white noise, seeded by id
+#  |              ├── picker.annotate()           ← SeisBench batch annotation
+#  |              ├── picker.classify_aggregate() ← aggregate TTA picks
+#  |              ├── _process_peak_times()       ← cluster picks + uncertainty per phase
+#  |              |    ├── _cluster_picks()       ← group nearby picks, one per cluster
 #  |              |    |    └── _weighted_median() ← confidence-weighted pick time
-#  |              |    └── _tta_uncertainty()      ← timing spread across TTA reps
+#  |              |    └── _tta_uncertainty()     ← timing spread across TTA reps
 #  |              |         └── _weighted_std()   ← confidence-weighted std
-#  |              └── _predict_polarity_tta()      ← optional, per accepted P pick; reuses TTA Z collection
-#  ├── _save_picks()                    ← serialise Pick objects; writes JSON and/or SC3ML to disk
-#  |    |                                 (same DOY directory), per self.pick_output
-#  |    ├── _scale_uncertainty()       ← raw TTA sample-domain std → seconds (applied once,
-#  |    |                                 shared by both output paths)
-#  |    └── _build_catalog()           ← optional, only if pick_output includes "sc3ml";
-#  |         |                            obspy Catalog: one Event holding all P/S picks
-#  |         └── _scale_uncertainty()  ← re-uses the same calibrated scaling
-#  ├── _filter_streams_by_picks()       ← optional, only if filter_by_pick enabled; keep detections with P or S pick
-#  └── _output()                        ← zero-fill gaps, write MiniSEED to disk
+#  |              └── _predict_polarity_tta()     ← optional, per accepted P pick
+#  ├── _save_picks()                     ← serialise Pick objects; JSON and/or SC3ML
+#  |    ├── _scale_uncertainty()         ← raw TTA sample-domain std → seconds
+#  |    └── _build_catalog()             ← optional to collect picks, only if pick_output includes "sc3ml"
+#  ├── _filter_streams_by_picks()        ← optional, only if filter_by_pick enabled
+#  └── _output()                         ← gap masking, optional zero-padding,
+#                                          write denoised (and optionally raw) MiniSEED
+#
+# ─── LEGACY: defined but not called by the pipeline ───────────────────────────
+#
+#    apply_pre_filt / _trace / _stream   ← replaced by _preprocess_combined()
+#    _get_response_parameters()          ← cached response for _fast_remove_response()
+#    _fast_remove_response()             ← replaced by _preprocess_combined()
+#    _compute_stfts()                    ← per-window STFT; replaced by
+#                                          _compute_global_stfts() (identical output)
+#    commented-out normalize_percentile / sklearn variants (lines 184–265)
+
+###############################################################################################
+# LEGACY
 def apply_pre_filt(data, samp_rate, pre_filt,taper_seconds=300):
     """Apply ObsPy's remove_response pre_filt step (no response correction).
 
-    Calls ObsPy functions directly. Reproduces the pre_filt block of
-    obspy.core.trace.Trace.remove_response with defaults:
-        zero_mean=True, taper=True, taper_fraction=0.05
+    LEGACY: not called by the pipeline. _preprocess_combined() now performs the
+    pre-filter, decimation and response removal in a single FFT pass. Kept for
+    reference and A/B comparison.
 
-    Parameters
-    ----------
-    data      : array-like        Raw time-domain signal.
-    samp_rate : float             Sample rate in Hz.
-    pre_filt  : (f1, f2, f3, f4) Bandpass corner frequencies in Hz.
+    Reproduces the pre_filt block of obspy.core.trace.Trace.remove_response with
+    zero_mean=True, taper=True, and a cosine taper given in seconds rather than
+    as a fraction.
 
-    Returns
-    -------
-    ndarray float64  Pre-filtered signal in the time domain.
+    data          : array-like        Raw time-domain signal.
+    samp_rate     : float             Sample rate in Hz.
+    pre_filt      : (f1, f2, f3, f4)  Bandpass corner frequencies in Hz.
+    taper_seconds : float             Taper length per side, in seconds.
+
+    Returns : ndarray float64, pre-filtered signal, same length as `data`.
     """
     data = np.array(data, dtype=np.float64)
     npts = len(data)
@@ -161,14 +186,13 @@ def apply_pre_filt(data, samp_rate, pre_filt,taper_seconds=300):
 def apply_pre_filt_trace(trace, pre_filt,taper_seconds=300):
     """Apply pre_filt to a single ObsPy Trace, returns a new Trace.
 
-    Parameters
-    ----------
-    trace    : obspy.Trace        Input trace (not modified).
-    pre_filt : (f1, f2, f3, f4)  Bandpass corner frequencies in Hz.
+    LEGACY: not called by the pipeline (see apply_pre_filt).
 
-    Returns
-    -------
-    obspy.Trace  Copy with pre-filtered data (float64).
+    trace         : obspy.Trace        Input trace (not modified).
+    pre_filt      : (f1, f2, f3, f4)   Bandpass corner frequencies in Hz.
+    taper_seconds : float              Taper length per side, in seconds.
+
+    Returns : obspy.Trace, copy with pre-filtered data (float64).
     """
     out = trace.copy()
     out.data = apply_pre_filt(trace.data, trace.stats.sampling_rate, pre_filt,taper_seconds=taper_seconds)
@@ -178,16 +202,101 @@ def apply_pre_filt_trace(trace, pre_filt,taper_seconds=300):
 def apply_pre_filt_stream(stream, pre_filt,taper_seconds=300):
     """Apply pre_filt to every trace in an ObsPy Stream, returns a new Stream.
 
-    Parameters
-    ----------
-    stream   : obspy.Stream       Input stream (not modified).
-    pre_filt : (f1, f2, f3, f4)  Bandpass corner frequencies in Hz.
+    LEGACY: not called by the pipeline (see apply_pre_filt).
 
-    Returns
-    -------
-    obspy.Stream  New stream with pre-filtered traces (float64).
+    stream        : obspy.Stream       Input stream (not modified).
+    pre_filt      : (f1, f2, f3, f4)   Bandpass corner frequencies in Hz.
+    taper_seconds : float              Taper length per side, in seconds.
+
+    Returns : obspy.Stream, new stream with pre-filtered traces (float64).
     """
     return Stream([apply_pre_filt_trace(tr, pre_filt,taper_seconds=taper_seconds) for tr in stream])
+
+# import numpy as np
+# from sklearn.preprocessing import RobustScaler
+#
+#
+# def normalize_percentile(
+#     data,
+#     quantile_range=(25, 75),
+#     unit_variance=False,
+#     limit=1000,
+# ):
+#     """
+#     Robust normalization of 1-component complex data.
+#
+#     Real and imaginary components are normalized separately using
+#     sklearn's RobustScaler, then clipped to [-limit, limit].
+#
+#     -------
+#     np.ndarray
+#         Normalized and clipped data with the same shape as `data`.
+#     """
+#     scaler = RobustScaler(
+#         quantile_range=quantile_range,
+#         unit_variance=unit_variance,
+#     )
+#     data_real = data[..., 0]
+#     data_imag = data[..., 1]
+#
+#     real_norm = scaler.fit_transform(data_real.reshape(-1, 1)).reshape(data_real.shape)
+#     imag_norm = scaler.fit_transform(data_imag.reshape(-1, 1)).reshape(data_imag.shape)
+#
+#     real_norm = np.clip(real_norm, -limit, limit)
+#     imag_norm = np.clip(imag_norm, -limit, limit)
+#
+#     result = np.empty_like(data)
+#     result[..., 0] = real_norm
+#     result[..., 1] = imag_norm
+#
+#     return result
+
+# END LEGACY
+###############################################################################################
+
+def _normalize_stft_channels(  # ADDED; TESTING WITHOUT SKLEARN
+    data,
+    quantile_range=(25, 75),
+    unit_variance=False,  # Legacy
+    limit=1000,
+):
+    """
+    Robust per-channel normalisation of one STFT window.
+
+    Replaces the former normalize_percentile()/RobustScaler path. For
+    data.shape == (64, 256, 6), each of the 6 channels (real/imag of Z, N, E) is
+    centred on its own median and divided by its own inter-quantile range, then
+    clipped to [-limit, limit]. A zero range is replaced by 1.
+
+    The input is not modified; the returned array is float32, the dtype the EQS
+    model consumes.
+
+    data           : np.ndarray (..., C); the C channels are normalised separately
+    quantile_range : (low, high) percentiles defining the scale
+    unit_variance  : unused, kept for signature compatibility (legacy)
+    limit          : float, clip bound applied after scaling
+
+    Returns : np.ndarray float32, same shape as `data`
+    """
+
+    # normalized = data.copy()
+    normalized = data.astype(np.float32, copy=True)
+
+    q_min, q_max = quantile_range
+
+    # Compute median, lower quantile and upper quantile for each channel.
+    center, q_low, q_high = np.nanpercentile(normalized,  # CHANGED TO NANPERCENTILE
+        (50, q_min, q_max),axis=tuple(range(normalized.ndim - 1)))
+
+    scale = q_high - q_low
+    scale[scale == 0] = 1
+
+    normalized -= center
+    normalized /= scale
+
+    np.clip(normalized,-limit,limit,out=normalized)
+
+    return normalized
 
 def _predict_polarity_tta(
     z_tta_collection,
@@ -197,25 +306,36 @@ def _predict_polarity_tta(
     polarity_model,
     win=256,
     threshold=0.33,
+    training=True
 ):
     """
-    Polarity prediction using the already-augmented TTA Z traces from
-    _stream_tta — no re-augmentation or noise re-scaling needed.
+    Polarity prediction from the TTA Z traces already produced by _stream_tta()
+    — no re-augmentation and no noise re-scaling.
 
-    z_tta_collection  : obspy.Stream, full TTA collection from _stream_tta,
-                        containing repeat Z/N/E augmented traces
-    z_starttime       : obspy.UTCDateTime, starttime of the original Z snippet
-                        (before the +add padding in _process_snippet)
-    z_sampling_rate   : float, samples per second
-    p_pick            : obspy.UTCDateTime, accepted P pick time
-    polarity_model    : tf.keras.Model, input shape (batch, win) or (batch, win, 1)
-    win               : int, sample window centred on P pick (default 256)
-    threshold         : float, min winning class probability; below → undecidable
+    One `win`-sample window centred on the P pick is cut from every Z trace in
+    the TTA collection, zero-padded where the window runs past the trace, and
+    peak-normalised. The batch goes through the polarity model; with
+    training=True any dropout stays active, so the spread across the batch
+    reflects both TTA noise and model uncertainty. The softmax vectors are
+    averaged, and the winning class is returned unless its mean probability is
+    below `threshold`, in which case 'undecidable' is returned.
+
+    z_tta_collection : obspy.Stream, full TTA collection from _stream_tta()
+                       (Z traces are selected here)
+    z_starttime      : obspy.UTCDateTime, starttime of the padded Z snippet used
+                       for picking, i.e. the reference the pick times refer to
+    z_sampling_rate  : float, samples per second
+    p_pick           : obspy.UTCDateTime, accepted P pick time
+    polarity_model   : tf.keras.Model, input (batch, win) or (batch, win, 1)
+    win              : int, sample window centred on the P pick (default 256)
+    threshold        : float, min winning-class probability; below → undecidable
+    training         : bool, keep dropout active (MC dropout) during inference
 
     Returns dict:
-        label            : str, 'positive' | 'negative' | 'undecidable'
-        probabilities    : np.ndarray shape (3,), mean softmax over TTA batch
-        all_predictions  : np.ndarray shape (repeat, 3), per-repetition softmax
+        label           : 'positive' | 'negative' | 'undecidable'
+        probabilities   : np.ndarray (3,), mean softmax over the batch,
+                          ordered [negative, undecidable, positive]
+        all_predictions : np.ndarray (repeat, 3), per-repetition softmax
     """
     labels = np.array(["negative", "undecidable", "positive"])
 
@@ -240,7 +360,7 @@ def _predict_polarity_tta(
     if polarity_model.input_shape[-1] == 1:
         z_batch = z_batch[:, :, np.newaxis]                              # (repeat, win, 1)
 
-    pred      = polarity_model(z_batch, training=True).numpy()           # (repeat, 3)
+    pred      = polarity_model(z_batch, training=training).numpy()           # (repeat, 3)
     mean_pred = pred.mean(axis=0)                                        # (3,)
 
     label = labels[np.argmax(mean_pred)]
@@ -278,6 +398,14 @@ class Pick:
     polarity:    Optional[dict] = field(default=None)
 
 class MaxAbsNorm1D(tf.keras.layers.Layer):
+    """
+    Keras layer: divide each (batch, channel) by its own maximum absolute value
+    over time. Part of the polarity model, so it must be passed in
+    custom_objects when that model is loaded (see __init__, line 595).
+    `eps` floors the divisor so an all-zero trace cannot produce NaNs.
+
+    Input/output shape: (batch, time, channels)
+    """
     def __init__(self, eps=1e-6, **kwargs):
         super().__init__(**kwargs)
         self.eps = eps
@@ -290,6 +418,15 @@ class MaxAbsNorm1D(tf.keras.layers.Layer):
 
 @tf.keras.utils.register_keras_serializable(package="custom")
 class ReflectPad1D(Layer):
+    """
+    Keras layer: reflect-pad the time axis by `pad` samples on each side. Part
+    of the EQShyb (EQS2) model, so it must be passed in custom_objects when that
+    model is loaded (see __init__, line 571). Registered as a serialisable Keras
+    object.
+
+    Input shape:  (batch, time, channels)
+    Output shape: (batch, time + 2*pad, channels)
+    """
     def __init__(self, pad, **kwargs):
         super().__init__(**kwargs)
         self.pad = int(pad)
@@ -306,9 +443,15 @@ class ReflectPad1D(Layer):
 
 class RelativeTimeFormatter(logging.Formatter):
     """
-    Class to make useful debugging output
-    """
+    Configure the root logger with a single stream handler that prefixes each
+    line with elapsed time, logger name and function name.
 
+    Existing root handlers are cleared, so this replaces any logging
+    configuration set earlier in the session. Called once from
+    Denoiser.__init__().
+
+    debug : bool, DEBUG level if True, otherwise INFO
+    """
     def format(self, record):
         elapsed = time.perf_counter() - _PROGRAM_START
         record.relative_time = f"{elapsed:8.2f}s"
@@ -335,29 +478,38 @@ def setup_logging(debug=False):
     root.handlers.clear()
     root.addHandler(handler)
 
-
+######################################################################################################################
+# Main Denoiser class
 class Denoiser(object):
     """
-    Module implementing denoising according to
-    Nikolaj Dahmen; John Clinton; Men‐Andrin Meier; Luca Scarabello 'Toward
-    Operational Earthquake Seismogram Denoising'
+    Operational earthquake seismogram denoising, detection and phase picking.
+
+    Implements the method of
+    Nikolaj Dahmen, John Clinton, Men-Andrin Meier, Luca Scarabello,
+    'Toward Operational Earthquake Seismogram Denoising',
     https://doi.org/10.1785/0120250198
 
-    I have made some tests with Cuda, the results not being satisfactory,
-    i.e. the performance gain is minimal.
+    Pipeline per processing window (see the call tree at the top of this file):
+    fetch and restitute waveforms → STFT over sliding 61.2 s windows → EQS mask
+    prediction and detection → window re-alignment and second EQS pass →
+    optional EQShyb time-domain refinement → stream assembly and overlap
+    resolution → optional TTA phase picking and polarity → MiniSEED and pick
+    files on disk.
 
-    The software, as it is, is first I/O bound and then memory bound and
-    doesn't profit from GPUs, at least not with the current pricing scheme
-    of ETH. This decision might have to be revisited at another stage when
-    the environment changes.
+    Two entry points:
+      run_data()      — one time window (typically one day)
+      run_timerange() — several days; a loader thread fetches the next day while
+                        the consumer thread processes the current one
 
-    The GPU optimised code is left, but currently unused.
+    Outputs are written next to the EQS model file, in a DOY<julday> folder:
+      <stream_id>_denoised.mseed          denoised detection snippets
+      <stream_id>_raw.mseed               restituted input (only if save_raw)
+      picks_<stream_id>_DOY<julday>.json  picks (if pick_output includes json)
+      picks_<stream_id>_DOY<julday>.xml   SC3ML (if pick_output includes sc3ml)
 
-    The code uses a pipeline concept when used in multiday mode
-    (run_timerange()). One thread reads the files using the client
-    (typically fully I/O bound), one thread does the processing. This way,
-    the next file can be loaded while the proceeding file is being
-    processed.
+    Note that the number of traces in the denoised file is not necessarily the
+    number of detections: _output() runs Stream._cleanup(), which merges
+    snippets that end up exactly contiguous.
 
     Authors: Niko Dahmen, Roman Racine
     """
@@ -368,45 +520,99 @@ class Denoiser(object):
                  polarity_model_path=None, polarity_kwargs=None,
                  filter_by_pick=False,pick_output="json", debug=False):
         """
-        data_client          : obspy client to get data
-        metadata_client      : obspy client to get metadata
-        model_path           : path to trained EQS model
-        min_peak_height      : min peak height for detection
-        eqs2_model_path      : optional path to EQShyb model
-        picker               : optional SeisBench picker for phase picking
-        picking_kwargs       : optional dict of kwargs passed to _process_picks
-        polarity_model_path  : optional path to polarity model; if given the
-                               model is loaded and applied to every accepted
-                               P pick; expects input (batch, 256) or
-                               (batch, 256, 1)
-        polarity_kwargs      : optional dict, currently supports key
-                               'threshold' (float, default 0.33) — minimum
-                               winning class probability to accept a polarity
-                               label, below which 'undecidable' is returned
-        filter_by_pick       : optional bool (default False); if True, only detections
-                               with at least one P or S pick are written to MiniSEED;
-                               requires picker to be set, otherwise has no effect
-        pick_output          : optional str (default "json"); pick output format —
-                               "json"  : picks JSON only
-                               "sc3ml" : obspy Catalog written as SC3ML only
-                               "both"  : both files, same stem, .json and .xml
-                               Has no effect if picker is None.
-        debug                : enable verbose logging
+        Load the models and set all processing constants.
+
+        data_client          : obspy client used to fetch waveforms
+        metadata_client      : obspy client used to fetch station inventory
+        model_path           : path to the trained EQS model. Its parent
+                               directory is also the output root: results go to
+                               <parent>/DOY<julday>/
+        min_peak_height      : float, minimum mask-timeseries peak height for a
+                               detection (first-pass threshold)
+        eqs2_model_path      : optional path to the EQShyb (EQS2) model. If
+                               given, accepted detections are refined in the
+                               time domain and the EQS2 uncertainty calibration
+                               is used
+        picker               : optional SeisBench picker. If None, picking and
+                               pick output are skipped entirely
+        picking_kwargs       : optional dict passed to _process_picks()
+                               (repeat, pick_tolerance, p_confidence,
+                               s_confidence, min_share_models). A 'max_workers'
+                               entry is consumed here into self.pick_workers.
+                               The dict is copied, so the caller's is untouched
+        polarity_model_path  : optional path to the polarity model, applied to
+                               every accepted P pick. Expects input
+                               (batch, 256) or (batch, 256, 1)
+        polarity_kwargs      : optional dict; 'threshold' (float, default 0.33)
+                               minimum winning-class probability, and
+                               'mc_dropout' (bool, default True) to keep dropout
+                               active during polarity inference
+        filter_by_pick       : optional bool (default False). If True, only
+                               detections with at least one P or S pick are
+                               written to MiniSEED. Requires `picker`
+        pick_output          : "json" | "sc3ml" | "both" (default "json").
+                               Ignored when picker is None
+        debug                : bool, enables DEBUG-level logging
+
+        Instance attributes set here that control the processing:
+          threshold            10    minimum summed mask value over a detection
+                                     window for it to be accepted (set very low, not main detection threshold)
+          buffer               300   pre/post seconds added to each fetch, used
+                                     by the taper and trimmed off afterwards.
+                                     Reduce for short windows
+          len_sample           6120  samples per model window (61.2 s at 100 Hz)
+          shift_samples        3072  stride between windows = 128 STFT bins.
+                                     Must stay a multiple of the STFT hop (24)
+          bins_overlap         128   bins shared by adjacent windows; maps
+                                     even-stream peaks onto the odd stream
+          pre_filt                   cosine taper corners (Hz) for restitution
+          stft_parameters            nperseg 48, noverlap 24, nfft 126, fs 100
+                                     → one window gives (64 freq, 256 time) bins
+          bin_spacing          0.24  seconds per STFT bin
+          REALIGN_SCORE_TOLERANCE 1  the re-aligned window replaces the original
+                                     only if its score exceeds this factor times
+                                     the original score
+          signal_buffer_s      3.0   seconds kept before the signal start when
+                                     trimming, and minimum separation between
+                                     two detections
+          pad_seconds          0     if > 0, each output trace is zero-padded
+                                     backwards by this many seconds, clamped so
+                                     traces never overlap. Implemented for SeisComP scamp, scmag
+          one_sample_s         0.01  one sample in seconds at 100 Hz
+          save_raw             False if True, _output() also writes the
+                                     restituted input as <stream_id>_raw.mseed
+          uncertainty_scaling        empirical sample-domain → seconds
+                                     calibration, EQS or EQS2 depending on
+                                     eqs2_model_path
+          response_cache       {}    keyed by (net, sta, loc, epoch, npts);
+                                     only used by the legacy response path
+          components           None  set in _get_data(), Z first
+
+        Raises ValueError if pick_output is not one of the three allowed values.
         """
 
         self.min_peak_height = min_peak_height  # main detection threshold
         self.data_client = data_client  # data client
         self.metadata_client = metadata_client  # metadata client
         self.threshold = 10  # minimum summed mask value over a detection window to accept a peak
+        # !dont change for long windows for safe response removal:
         self.buffer = 300 # pre/post buffer (s) added to data fetch window for response removal (reduce for shorter time windows)
         self.len_sample = 6120  # length of denoiser prediction window
-        self.shift_samples = int(self.len_sample / 2)  # hop size between even/odd STFT streams (half window)
+        # self.shift_samples = int(self.len_sample / 2)  # hop size between even/odd STFT streams (half window) # ORIGINAL
+        self.shift_samples = 3072  # MOD for GLOBAL STFT, allows using global STFT and modifying it
+
         self.bins_overlap = 128  # number of overlapping STFT time bins between adjacent windows
         self.model_name = model_path  # path to EQS model, reused for output directory naming
         self.pre_filt = [1 / 100, 1 / 20, 45, 50]   # bandpass corners (Hz) for cosine taper pre-filter
+        # lower upper corner frequency would remove high freq noise for few foreign 100sps stations (restitution noise),
+        # but model was also trained this noise.
+        # self.pre_filt = [1 / 100, 1 / 20, 45, 47.5]   # bandpass corners (Hz) for cosine taper pre-filter
+
+        print("CHECK PREFILT")
         self.stft_parameters = {"nperseg": 48, "nfft": 126, "fs": 100,"noverlap": 24}
         self.REALIGN_SCORE_TOLERANCE = 1#0.5#1 # 0.5 # NEW added
         self.signal_buffer_s = 3.0  # buffer to start save denoised stream with at least 3s before signal start (ideally)
+        self.pad_seconds = 120.0  #  NEW ZEROPADDING FOR SEISCOMP
         self.one_sample_s = 1.0 / self.stft_parameters["fs"]  # = 0.01s at 100 Hz
 
         self.bin_spacing = (self.stft_parameters["nperseg"] - self.stft_parameters["noverlap"]) / self.stft_parameters["fs"]  # = 0.24
@@ -420,10 +626,13 @@ class Denoiser(object):
             custom_objects={"ReflectPad1D": ReflectPad1D},
             compile=False
         ) if eqs2_model_path else None
+        self.save_raw = False
 
         # PICKER
         self.picker = picker  # passed seisbench picker
-        self.picking_kwargs = picking_kwargs or {}   # picking kwargs
+        self.picking_kwargs = dict(picking_kwargs or {})   # copy: don't mutate caller's dict
+        self.pick_workers = self.picking_kwargs.pop("max_workers", 1)  # LEAVE AT 1 FOR REPRODUCABILITY
+
         if eqs2_model_path is None: # uncertainty scaling; calibrated for EQS + EQTransformer-ethz, check floor in weighed_std
             self.uncertainty_scaling = {
                 'p_picks': {'scale_sample': 4*1.904, 'offset_sample': 9.249},
@@ -442,6 +651,7 @@ class Denoiser(object):
             compile=False
         ) if polarity_model_path else None
         self.polarity_threshold = (polarity_kwargs or {}).get('threshold', 0.33)  # polarity minimum threshold; 0.33 --> effectively no threshold
+        self.polarity_mc_dropout = (polarity_kwargs or {}).get('mc_dropout', True)   # flag to turn of MC dropout
 
         self.filter_by_pick = filter_by_pick  # if True, only write MiniSEED for detections with a P or S pick
         self.components = None  # set in _get_data()
@@ -458,12 +668,22 @@ class Denoiser(object):
     def _loader_thread(self, startday, endday, network, station, location,
                        channel, output_queue):
         """
-        This thread reads files using the provided client. This can run while
-        the consumer thread is processing the proceeding file.
+        Producer thread for run_timerange(): fetches one day at a time and pushes
+        it onto the queue, so the next day downloads while the current one is
+        processed.
 
-        startday: obspy.core.UTCDateTime, first day which should be processed
-        endday: obspy.core.UTCDateTime, last day which should be processed
-        output_queue: queue to which read files are put
+        Each day is fetched with self.buffer seconds of extra data on each side,
+        and its end is snapped to a whole number of 61.2 s windows by
+        _round_to_window(). A SENTINEL is pushed after the last day.
+
+        startday     : obspy.UTCDateTime, first day to process
+        endday       : obspy.UTCDateTime, last day to process (inclusive)
+        network      : str, FDSN network code
+        station      : str, FDSN station code
+        location     : str, FDSN location code (wildcards accepted)
+        channel      : str, 2-char channel prefix; "?" is appended here
+        output_queue : queue.Queue receiving (data, day_start, day_end, network,
+                       station, location, channel) tuples, then SENTINEL
         """
 
         logger.debug("")
@@ -481,10 +701,11 @@ class Denoiser(object):
 
     def _consumer_thread(self, input_queue):
         """
-        This threads consumes obspy.core.Stream objects from the queue and
-        runs run_data() on it.
+        Consumer thread for run_timerange(): takes one day off the queue and runs
+        run_data() on it. Returns when SENTINEL is received. Runs in the calling
+        thread, so exceptions propagate to the caller.
 
-        input_queue: queue to consume from
+        input_queue : queue.Queue filled by _loader_thread()
         """
 
         logger.debug("")
@@ -520,19 +741,21 @@ class Denoiser(object):
     def _get_metadata(self, network, station, location, channel,
                       starttime, endtime):
         """
-        strips location, channel, starttime and endtime from request
-        and then queries _query_server which then loads the full inventory
-        for a station if needed and otherwise returns this information
-        from cache. This should reduce queries to fdsnws.
+        Return the inventory subset matching one request.
 
-        network: network code
-        station: station code
-        location: location code
-        channel: channel code
-        starttime: start time (obspy.core.UTCDateTime)
-        endtime: end time (obspy.core.UTCDateTime)
+        The full station inventory is fetched (and cached) by _query_server();
+        this method only applies inventory.select(), which keeps FDSN traffic at
+        one request per station even when location, channel or time window vary.
+
+        network   : str, network code
+        station   : str, station code
+        location  : str, location code (wildcards accepted)
+        channel   : str, channel code (wildcards accepted)
+        starttime : obspy.UTCDateTime, start of the validity window
+        endtime   : obspy.UTCDateTime, end of the validity window
+
+        Returns : obspy.Inventory, the selected subset
         """
-
         logger.debug("")
         inventory = self._query_server(network, station)
         return inventory.select(network, station, location, channel,
@@ -540,15 +763,30 @@ class Denoiser(object):
 
     def _get_response_parameters(self, data, inventory):
         """
-        Computes the response parameters for a specific input length for
-        a specific station configuration. These can then used be directly
-        instead of being recomputed every time when remove_response is called.
+        Build, and cache, everything needed to deconvolve one trace length.
 
-        data: obspy.core.Stream: Input data for which response parameters
-              should be computed
-        inventory: Matching inventory (created by inventory.select()).
+        LEGACY: only used by _fast_remove_response(), which the pipeline no
+        longer calls. _preprocess_combined() computes the same quantities inline.
 
-        Returns response parameters
+        The cache key is (network, station, location, epoch start, npts) — the
+        channel code is deliberately omitted, assuming all three components share
+        one response.
+
+        The response is evaluated at RESP_NFFT (32768) frequencies and linearly
+        interpolated onto the full FFT grid, real and imaginary parts separately.
+        The response is a smooth rational function of frequency, so the error is
+        a few times 1e-8 relative while avoiding millions of evalresp calls.
+
+        data      : obspy.Stream, used only for length, delta and sampling rate
+        inventory : obspy.Inventory, already selected for this station
+
+        Returns tuple:
+            taper_coeffs      np.ndarray (npts,), time-domain cosine taper
+            freq_response     np.ndarray, INVERSE response on the FFT grid
+                              (element 0 zeroed)
+            freqs             np.ndarray, FFT frequencies in Hz
+            freq_domain_taper np.ndarray, cosine_sac_taper for self.pre_filt
+            nfft              int, FFT length used
         """
 
         network = inventory[0].code
@@ -574,37 +812,54 @@ class Denoiser(object):
         taper_coeffs = cosine_taper(npts, p_fraction,
                                     sactaper=True, halfcosine=False)
 
+        # OLD-----------
+        # nfft = _npts2nfft(npts)
+        # freq_response, freqs = \
+        #     response.get_evalresp_response(data[0].stats.delta, nfft,
+        #                                    output="VEL")
+        # freq_domain_taper = cosine_sac_taper(freqs, flimit=self.pre_filt)
+        # freq_response[0] = 0.0
+        # freq_response[1:] = 1.0 / freq_response[1:]
+        # self.response_cache[dictkey] = (taper_coeffs, freq_response, freqs,
+        #                                 freq_domain_taper, nfft)
+        # NEW-----------
         nfft = _npts2nfft(npts)
-        freq_response, freqs = \
-            response.get_evalresp_response(data[0].stats.delta, nfft,
-                                           output="VEL")
-        freq_domain_taper = cosine_sac_taper(freqs, flimit=self.pre_filt)
+        freqs = np.fft.rfftfreq(nfft, d=data[0].stats.delta)
+
+        # evaluate response at few points, interpolate to full grid
+        RESP_NFFT = 32768
+        resp_raw, freqs_small = response.get_evalresp_response(
+            data[0].stats.delta, RESP_NFFT, output="VEL")
+        resp_raw[0] = 1.0
+        inv_resp_small = 1.0 / resp_raw
+
+        freq_response = (
+            np.interp(freqs, freqs_small, inv_resp_small.real) +
+            1j * np.interp(freqs, freqs_small, inv_resp_small.imag)
+        )
         freq_response[0] = 0.0
-        freq_response[1:] = 1.0 / freq_response[1:]
+
+        freq_domain_taper = cosine_sac_taper(freqs, flimit=self.pre_filt)
         self.response_cache[dictkey] = (taper_coeffs, freq_response, freqs,
                                         freq_domain_taper, nfft)
+
 
         return (taper_coeffs, freq_response, freqs, freq_domain_taper, nfft)
 
     def _fast_remove_response(self, data, inventory):
         """
-        Remove instrument response using cached inverse frequency response.
+        Deconvolve the instrument response in place using cached parameters.
 
-        Used the relevant part of obspy.core.Trace and make use of possible
-        caching for frequency_response, and tapers, as they are always
-        the same for the same length and response
+        LEGACY: not called by the pipeline; _preprocess_combined() does this as
+        part of a single FFT pass.
 
-        Parameters
-        ----------
-        data : np.ndarray
-            Time-domain signal, shape (n_samples,)
+        Each trace is demeaned, tapered, transformed, multiplied by the
+        frequency-domain taper and the inverse response, and transformed back.
 
-        inventory: obspy inventory
+        data      : obspy.Stream, 3 traces of equal length; modified in place
+        inventory : obspy.Inventory, already selected for this station
 
-        Returns
-        -------
-        np.ndarray
-            Corrected time-domain trace
+        Returns : None
         """
 
         npts = len(data[0].data)
@@ -624,127 +879,82 @@ class Denoiser(object):
 
         return
 
-    # def stft_gpu(self, signal_np, fs=100, nperseg=48, noverlap=24,
-    #              nfft=126, target_frames=256):
-    #     """
-    #     GPU-accelerated STFT using CuPy, written by microsoft copilot
-    #     Matches SciPy STFT output shape: (freq, time) = (64, 256)
-    #
-    #     Status: Works, but is not faster than original code,
-    #     performance gains are lost when pre and postprocessing
-    #     input and output
-    #
-    #     Also: stft is not the bottle neck in this code
-    #     """
-    #
-    #     logger.debug("")
-    #     # ---- CPU → GPU ----
-    #     x = cp.asarray(signal_np, dtype=cp.float32)
-    #
-    #     step = nperseg - noverlap
-    #     needed_len = (target_frames - 1) * step + nperseg
-    #
-    #     # ---- pad so we always get target_frames ----
-    #     if x.shape[0] < needed_len:
-    #         x = cp.pad(x, (0, needed_len - x.shape[0]))
-    #
-    #     # ---- strided framing (NO copy!) ----
-    #     shape = (target_frames, nperseg)
-    #     strides = (x.strides[0] * step, x.strides[0])
-    #
-    #     frames = cp.lib.stride_tricks.as_strided(
-    #         x,
-    #         shape=shape,
-    #         strides=strides)
-    #
-    #     # ---- windowing ----
-    #     window = cp.hanning(nperseg)
-    #     frames *= window
-    #
-    #     # ---- FFT on GPU ----
-    #     spec = cp.fft.rfft(frames, n=nfft, axis=1)
-    #
-    #     # ---- return to CPU (freq x time) ----
-    #     return cp.asnumpy(spec.T).astype(np.complex64)
 
-    def _process_segment(self, data_window):
+
+    def _process_segment(self, data_window):  # NEW COMBINED 3 COMP
         """
         data_window: numpy array of shape (len_sample, 3)
                      Columns are Z, N, E components.
         Returns:
-                (raw_stft, norm_stft) each shaped (64, 256, 6)
+            (raw_stft, norm_stft) each shaped (64, 256, 6)
         """
 
         logger.debug("")
-        # Expecting shape (len_sample, 3)
+
         if data_window.shape[0] != self.len_sample or \
                 data_window.shape[1] != 3:
             logger.debug("returning None")
             return None
 
-        stft_tmp = np.zeros((64, 256, 6), dtype=float)
-        stft_tmp_norm = np.zeros((64, 256, 6), dtype=float)
-
-        # Loop over 3 components: 0=Z, 1=N, 2=E
+        # stft_tmp = np.zeros((64, 256, 6), dtype=float)
+        # stft_tmp_norm = np.zeros((64, 256, 6), dtype=float)
+        stft_tmp = np.zeros((64, 256, 6), dtype=np.float32)
+        stft_tmp_norm = np.zeros((64, 256, 6), dtype=np.float32)
+        # =========================================================
+        # STFT
+        # =========================================================
         for j in range(3):
             snippet_tmp = data_window[:, j]
 
-            # STFT for one component
-            _, _, _stft = scipy.signal.stft(snippet_tmp,
-                                            **self.stft_parameters)
-    #        _stft = self.stft_gpu(snippet_tmp)
+            t_stft = time.perf_counter()
 
-            # real/imag into CNN layout
-            stft_tmp[:, :, j*2] = _stft.real
-            stft_tmp[:, :, j*2 + 1] = _stft.imag
+            _, _, _stft = scipy.signal.stft(
+                snippet_tmp,
+                **self.stft_parameters)
+            # _stft = self.stft_gpu(snippet_tmp)
 
-            # Normalize (2 channels)
-            block = np.stack((_stft.real, _stft.imag), axis=2)
-            block_norm = normalize_percentile(block)
+            # Real / imaginary
+            stft_tmp[:, :, j * 2] = _stft.real
+            stft_tmp[:, :, j * 2 + 1] = _stft.imag
 
-            stft_tmp_norm[:, :, j*2] = block_norm[:, :, 0]
-            stft_tmp_norm[:, :, j*2 + 1] = block_norm[:, :, 1]
+        # =========================================================
+        # NORMALIZATION
+        # =========================================================
+        t_norm = time.perf_counter()
 
-        return stft_tmp, stft_tmp_norm # (64,256,6)
-        # return (
-        #     stft_tmp[np.newaxis, ...],        # (1,64,256,6)
-        #     stft_tmp_norm[np.newaxis, ...]
-        #     )
+        stft_tmp_norm = _normalize_stft_channels(
+            stft_tmp,
+            quantile_range=(25, 75),
+            unit_variance=False,
+            limit=1000,
+        )
+
+        return stft_tmp, stft_tmp_norm
+
 
     def _compare_arrays_time_overlap(self, array1, array2, overlap=0.75):
         """
-        Compare two arrays of time intervals and select overlapping
-        intervals with higher scores.
+        Merge the even and odd detection lists, keeping the better of each pair.
 
-        Each row in the input arrays should contain:
-        [peak, start_time, end_time, score, maxval].
+        Two intervals count as the same detection when they overlap by more than
+        `overlap` times the shorter of the two durations. For each row of array1,
+        every overlapping row of array2 is considered and the higher-scoring one
+        wins. Rows of array2 that never overlapped anything are appended.
 
-        For each interval in array1, the function finds intervals in
-        array2 that overlap by at least a fraction `overlap` of the smaller
-        interval's duration. It keeps
-        the interval with the higher score for overlapping pairs.
+        The output therefore starts with one row per array1 entry, in array1
+        order, followed by the unmatched array2 rows: it is NOT sorted in time.
+        Callers that index other lists alongside it must preserve this order.
 
-        Intervals in array2 not overlapping any interval in array1 are also
-        included.
+        All positions are in BINS, as produced by get_peaks().
 
-        Parameters:
-        -----------
-        array1 : array-like (N1 x 5)
-            First array of intervals.
+        array1  : array-like (N1, 5), rows [peak, start, end, score, maxval]
+                  (even stream, already shift-corrected)
+        array2  : array-like (N2, 5), same layout (odd stream)
+        overlap : float, minimum overlap fraction of the shorter interval
 
-        array2 : array-like (N2 x 5)
-            Second array of intervals.
-
-        overlap : float, optional (default=0.75)
-            Minimum required overlap fraction relative to the smaller interval.
-
-        Returns:
-        --------
-        final_rows : np.ndarray
-            Combined array of intervals after comparison.
-
-        origins : list of int
-            Indicator list where 0 means interval from array1, 1 from array2.
+        Returns tuple:
+            final_rows np.ndarray (D, 5), merged detections
+            origins    list of int, 0 if the row came from array1, 1 from array2
         """
 
         logger.debug("")
@@ -791,21 +1001,22 @@ class Denoiser(object):
 
     def _get_mask_timeseries(self, mask_array):
         """
-        Extract two time series from a 4D mask array by computing a
-        weighted mean of maximum mask values across selected channels
-        at each time step, then splitting the result into even and odd
-        time steps.
+        Collapse the 4D mask array into two 1D detection timeseries.
 
-        The weighted mean gives double weight to the first channel and
-        equal weight to the next two.
+        For each window and time bin, the maximum mask value over frequency is
+        taken per component, then averaged with double weight on the first
+        component (Z) and single weight on the two horizontals.
 
-        Parameters:
-        -----------
-        mask_array : np.ndarray
-            4D array where the last dimension indexes channels.
+        Windows are then split by parity and concatenated. Because shift_samples
+        is 128 bins and a window is 256 bins, the even windows tile the time axis
+        exactly, and so do the odd ones, offset by 128 bins. Array index therefore
+        equals global bin index for the even stream.
 
-        array_odd : np.ndarray
-            Concatenated values from odd-indexed time steps.
+        mask_array : np.ndarray (W, 64, 256, 3), EQS masks
+
+        Returns tuple:
+            array_even np.ndarray, concatenated bins of windows 0, 2, 4, …
+            array_odd  np.ndarray, concatenated bins of windows 1, 3, 5, …
         """
 
         # extract time series of mask as mean value of max. / mean mask values
@@ -822,37 +1033,35 @@ class Denoiser(object):
 
 
 
-    def get_peaks(self, timeseries, threshold=0.1, shift_correction=0):
+    def _get_peaks(self, timeseries, threshold=0.1, shift_correction=0):  # ORIGINAL
         """
-        Detect peaks in a timeseries exceeding a given threshold
-        and find their onset and end points.
+        Find detection peaks in a mask timeseries, with onset and end.
 
-        Peaks are detected using a minimum distance between peaks.
-        For each peak, the function finds:
-        - The left boundary where the signal falls below 0.01 before the peak.
-        - The right boundary where the signal falls below 0.05 after the peak.
-        - The sum of values between the left and right boundaries.
-        - The peak value itself.
+        Peaks must exceed `threshold` and be at least 128 bins (30.7 s) apart.
+        For each peak the onset is the last bin before it that fell below 0.01,
+        and the end the first bin after it that falls below 0.05; both thresholds
+        are fixed. The score is the sum of the timeseries between those bounds,
+        which favours long, strong signals.
 
-        threshold : float, optional (default=0.1)
-            Minimum height of peaks to be detected.
+        All returned indices are BIN INDICES (0.24 s per bin), not seconds.
+        Convert with "× self.bin_spacing".
 
-        shift_correction : int, optional (default=0)
-            Value subtracted from detected indices to adjust for any offset.
+        timeseries       : 1D np.ndarray, even or odd mask timeseries
+        threshold        : float, minimum peak height
+        shift_correction : int, subtracted from all three indices, in bins. Used
+                           with bins_overlap (128) for the even stream so both
+                           streams end up in one coordinate system
 
-        Returns:
-        --------
-        np.ndarray
-            Array of detected peaks with columns:
-            [peak_index, left_boundary_index, right_boundary_index
-            sum_between_boundaries, peak_value].
+        Returns : np.ndarray (P, 5), columns
+                  [peak, onset, end, score, peak_value]; empty array if no peak
+                  passes the threshold.
         """
 
         logger.debug("")
         peaks, _ = find_peaks(timeseries, height=threshold, distance=128)
 
         peaks_info = []
-        for peak in peaks:
+        for peak in peaks:  # typically only for ~100 peaks / 24h
             left = np.where(timeseries[:peak] < 0.01)[0]
             left_index = left[-1] if len(left) else 0
 
@@ -868,16 +1077,148 @@ class Denoiser(object):
 
         return np.array(peaks_info)
 
+
+    # ################### QUICK TEST ----------------------------------------------------------
+    def _preprocess_combined(self, data, inventory):
+        """
+        Restitute and downsample to 100 Hz in one FFT round-trip per trace.
+
+        Replaces the former three-step chain apply_pre_filt_stream() →
+        decimate()/resample() → _fast_remove_response(). All three were
+        frequency-domain operations, so their operators are combined and applied
+        once:
+
+          1. demean, cosine taper (self.buffer seconds per side)
+          2. forward FFT at the original sample rate
+          3. multiply by cosine_sac_taper(self.pre_filt) × inverse response
+          4. keep only bins up to the new Nyquist (50 Hz) and inverse-FFT at the
+             shorter length — this performs the decimation, with the taper acting
+             as the anti-alias filter
+          5. rescale by nfft_new / nfft_orig, since the inverse FFT divides by
+             its own length
+
+        Two things make this fast. The FFT length comes from next_fast_len(npts)
+        rather than _npts2nfft(npts): the doubling in the latter guards against
+        circular convolution, which cannot occur here because the spectrum is
+        only multiplied point-wise. And the response is evaluated at 32768
+        frequencies (freq_resolution <0.01 Hz for 250sps data)
+        and interpolated onto the FFT grid rather than evaluated per bin.
+
+        data      : obspy.Stream, 3 traces of equal length and sample rate.
+                    Modified in place: data, sampling_rate and npts are all
+                    replaced with the 100 Hz version
+        inventory : obspy.Inventory, already selected for this station
+
+        Returns : None
+
+        Requires the original sample rate to be at least 100 Hz.
+        """
+        fs_orig = data[0].stats.sampling_rate
+        fs_target = self.stft_parameters["fs"]          # 100
+        npts_orig = len(data[0].data)
+        npts_new = int(round(npts_orig * fs_target / fs_orig))
+
+        # CHECK saver way to compute nfft_orig, nfft_new
+        # _ratio = Fraction(fs_orig / fs_target).limit_denominator(1000)
+        # _p, _q = _ratio.numerator, _ratio.denominator
+        # _k = next_fast_len(int(np.ceil(npts_orig / _p)))
+        # nfft_orig, nfft_new = _p * _k, _q * _k
+
+
+        # next_fast_len >= npts is enough with long buffer + cosine taper
+        nfft_orig = next_fast_len(npts_orig)
+        freqs = np.fft.rfftfreq(nfft_orig, d=1.0 / fs_orig)
+
+        # ── frequency-domain taper (anti-alias + bandpass) ────────────
+        freq_taper = cosine_sac_taper(freqs, flimit=self.pre_filt)
+
+        # ── inverse response — evaluate at few points, interpolate ────
+        RESP_NFFT = 32768
+        # RESP_NFFT = np.min([32768,nfft_orig])# CHANGE TO THIS FOR SHORT TRACES?
+
+        response = data[0]._get_response(inventory)
+        resp_raw, freqs_small = response.get_evalresp_response(
+            1.0 / fs_orig, RESP_NFFT, output="VEL")
+        resp_raw[0] = 1.0
+        inv_resp_small = 1.0 / resp_raw
+
+        # check if prob at long period (?)
+        freq_response = (
+            np.interp(freqs, freqs_small, inv_resp_small.real) +
+            1j * np.interp(freqs, freqs_small, inv_resp_small.imag)
+        )
+        freq_response[0] = 0.0
+
+        # ── combined operator: taper × inverse response ───────────────
+        combined = freq_taper * freq_response
+
+        # ── time-domain taper ─────────────────────────────────────────
+        p_frac = (self.buffer * fs_orig) / npts_orig
+        taper = cosine_taper(npts_orig, p=p_frac,
+                             sactaper=True, halfcosine=False)
+
+        # ── spectral decimation sizes ─────────────────────────────────
+        nfft_new = next_fast_len(npts_new)
+
+        # print("==============TEST===============")
+        # print(nfft_new == nfft_orig * fs_target / fs_orig)
+        # print("=============================")
+
+        n_copy = min(
+            int(nfft_orig * fs_target / (2 * fs_orig)) + 1,
+            nfft_new // 2 + 1,
+            nfft_orig // 2 + 1,
+        )
+        scale = nfft_new / nfft_orig
+
+
+        for trace in data:
+            x = trace.data.astype(np.float64)
+            x -= x.mean()
+            x *= taper
+
+            spec = _rfft(x, n=nfft_orig, workers=-1)
+            spec *= combined
+
+            spec_new = np.zeros(nfft_new // 2 + 1, dtype=spec.dtype)
+            spec_new[:n_copy] = spec[:n_copy] * scale
+
+            trace.data = _irfft(spec_new, n=nfft_new, workers=-1)[:npts_new]
+            trace.stats.sampling_rate = fs_target
+            trace.stats.npts = npts_new
+    # ################### END QUICK TEST ----------------------------------------------------------
+
+
     def _get_data(self, network, station, location, channel, starttime,
                   endtime, data=None):
         """
-        computes restituted data ready for use.
+        Fetch one window of waveforms and return them restituted at 100 Hz.
 
-        Returns restituted data, three components, gaps interpolated if
-        necessary as a tuple: (data, data_stack)
-        data: obspy.core.Stream containing the dat
-        data_stack: numpy stack containing the numerical values of the three
-                    channels
+        Steps: fetch (unless `data` is supplied) with self.buffer seconds extra on
+        each side → record gap intervals before merging loses them → merge with
+        zero fill → select the matching inventory → restitute and downsample via
+        _preprocess_combined() → trim the buffer off again.
+
+        Sets self.components, sorted descending so Z comes first and the two
+        horizontals follow in whatever order the station uses (N/E or 1/2).
+        data_stack columns follow the same order.
+
+        network   : str, FDSN network code
+        station   : str, FDSN station code
+        location  : str, FDSN location code (wildcards accepted)
+        channel   : str, 2-char channel prefix; "?" is appended here
+        starttime : obspy.UTCDateTime, start of the processing window
+        endtime   : obspy.UTCDateTime, end of the processing window
+        data      : obspy.Stream or None; if given it is used instead of
+                    fetching, and must already include the buffer
+
+        Returns tuple, or None when fewer than 3 traces survive the merge:
+            data          obspy.Stream, 3 restituted traces at 100 Hz, buffer
+                          trimmed off
+            data_stack    np.ndarray (N, 3) float64, columns in self.components
+                          order (Z first), velocity in m/s
+            gap_intervals list of (UTCDateTime, UTCDateTime), gaps found before
+                          merging; zeroed again in _output()
         """
 
         logger.debug("")
@@ -904,16 +1245,10 @@ class Denoiser(object):
         metadata = self._get_metadata(network, station, location,
                                       f"{channel}?", starttime, starttime)
 
-        # apply filter as in obspy remove_response prefilter & remove any other AA filter
-        data = apply_pre_filt_stream(data, self.pre_filt,taper_seconds=self.buffer)
 
-        if data[0].stats.sampling_rate % 100 == 0:
-            data.decimate(factor=int(data[0].stats.sampling_rate // 100),no_filter=True)
-        else:
-            # data.filter("lowpass", freq=45.0, corners=8, zerophase=False)  # NEW - add filter ???
-            data.resample(100,no_filter=True) # no filter default, additioonal AA off by frequency taper
 
-        self._fast_remove_response(data, metadata)
+        self._preprocess_combined(data, metadata)
+        ################### END QUICK TEST ----------------------------------------------------------
 
         data.trim(data[0].stats.starttime + buffer,
                   data[0].stats.endtime - buffer)
@@ -922,7 +1257,7 @@ class Denoiser(object):
         self.components = sorted([tr.stats.channel[-1] for tr in data], reverse=True)  # NEW get components and fix order in data
 
 
-        # z comp first, other componets abitrarily
+        # z comp first, other components can be abitrarily sorted
         data_stack = np.column_stack([
             data.select(component=self.components[0])[0].data,
             data.select(component=self.components[1])[0].data,
@@ -932,54 +1267,218 @@ class Denoiser(object):
 
         # return (data, data_stack)  # OLD
         return (data, data_stack, gap_intervals)  # NEW
-    def _compute_stfts(self, data_stack, starttime, endtime):
+
+
+    def _compute_stfts(self, data_stack, starttime, endtime):  # ORIGINAL + MOD
         """
-        Computes all STFTs in the given window, each 61.2s, shifted by 30.6s (50% overlap).
+        LEGACY — not called. run_data() uses _compute_global_stfts(), whose
+        output is bit-identical to this (verified over a full record, all bins).
+        Kept for reference and A/B testing.
 
-        starttime: UTCDateTime, actual start of data_stack[0] (data[0].stats.starttime),
-                   used for sample-accurate UTC timestamp generation.
-        endtime:   UTCDateTime, end of processing window, used only for logging.
+        Per-window implementation: one scipy.signal.stft call per window and
+        component, over a zero-copy sliding view of data_stack.
 
-        returns:
-        selected_starttimes: list of UTCDateTime, start time of each valid window
-        stft_collection:     np.ndarray (W, 64, 256, 6), raw STFT all valid windows
-        stft_norm_collection: np.ndarray (W, 64, 256, 6), normalised STFT all valid windows
+        Unlike _compute_global_stfts(), this does not require shift_samples to be
+        a multiple of the STFT hop.
+
+        data_stack : np.ndarray (N, 3), columns in self.components order
+        starttime  : obspy.UTCDateTime of data_stack[0]
+        endtime    : obspy.UTCDateTime, unused, kept for signature parity
+
+        Returns tuple:
+            selected_starttimes  list of UTCDateTime, start of each valid window
+            stft_collection      np.ndarray (W, 64, 256, 6) float32, raw STFT
+            stft_norm_collection np.ndarray (W, 64, 256, 6) float32, normalised
         """
 
         logger.debug("")
         # step = 61.2 / 2
 
-        num_windows = (data_stack.shape[0] - self.len_sample) // self.shift_samples + 1
+        # num_windows = (data_stack.shape[0] - self.len_sample) // self.shift_samples + 1
+        num_windows = max(0, (data_stack.shape[0] - self.len_sample) // self.shift_samples + 1)
         utc_start_list = [starttime + i * self.shift_samples / self.stft_parameters["fs"]
                           for i in range(num_windows)]
 
-        starts = np.arange(num_windows) * self.shift_samples
-        windows = np.stack([data_stack[s:s+self.len_sample] for s in starts],
-                           axis=0)
-        results = [self._process_segment(w) for w in windows]
+        # # ORIGINAL
+        # starts = np.arange(num_windows) * self.shift_samples
+        # windows = np.stack([data_stack[s:s+self.len_sample] for s in starts],
+        #                    axis=0) # can it be replaced with np.sliding_window_view
+        # # end ORIGINAL
+        # NEW
+        windows = np.lib.stride_tricks.as_strided(
+            data_stack,
+            shape=(num_windows, self.len_sample, 3),
+            strides=(self.shift_samples * data_stack.strides[0],
+                     data_stack.strides[0], data_stack.strides[1]),
+            writeable=False
+        )
+        #end NEW
 
-        valid = [r for r in results if r is not None]
-        selected_starttimes = [t for t, r in zip(utc_start_list, results)
-                               if r is not None]
-        # stft_collection = np.concatenate([result[0] for result in valid],
-        #                                  axis=0)
-        stft_collection = np.stack([result[0] for result in valid], axis=0)  # (N,64,256,6)
-        # stft_norm_collection = np.concatenate([result[1] for result in valid],
-        #                                       axis=0)
-        stft_norm_collection = np.stack([result[1] for result in valid], axis=0)  # (N,64,256,6)
+        # # ORIIGNAL
+        # results = [self._process_segment(w) for w in windows]
+        #
+        # valid = [r for r in results if r is not None]
+        # selected_starttimes = [t for t, r in zip(utc_start_list, results)
+        #                        if r is not None]
+        # stft_collection = np.stack([result[0] for result in valid], axis=0)  # (N,64,256,6)
+        # stft_norm_collection = np.stack([result[1] for result in valid], axis=0)  # (N,64,256,6)
+        # # end ORIGINAL
+
+        # NEW
+        stft_collection = np.zeros((num_windows, 64, 256, 6), dtype=np.float32)
+        stft_norm_collection = np.zeros((num_windows, 64, 256, 6), dtype=np.float32)
+        valid_mask = np.ones(num_windows, dtype=bool)
+        for i in range(num_windows):
+            result = self._process_segment(windows[i])
+            if result is None:
+                valid_mask[i] = False
+            else:
+                stft_collection[i] = result[0]
+                stft_norm_collection[i] = result[1]
+
+        stft_collection = stft_collection[valid_mask]
+        stft_norm_collection = stft_norm_collection[valid_mask]
+        selected_starttimes = [t for t, v in zip(utc_start_list, valid_mask) if v]
+        # end NEW
+
         return (selected_starttimes, stft_collection, stft_norm_collection)
+
+    def _compute_global_stfts(self, data_stack, starttime, endtime):
+        """
+        STFT the whole record once per component, then slice out model windows.
+
+        One scipy.signal.stft call per component covers the full time range.
+        Model window i is the 256-bin slice starting at global bin
+        i * shift_samples/hop, which is the same as the STFT of samples
+        [i*shift_samples : i*shift_samples + len_sample]. Every interior bin is
+        therefore computed once instead of twice, since adjacent windows overlap
+        by ~50 %.
+
+        The two outermost bins are the exception. A per-window STFT pads 24 zeros
+        on each side, so its bin 0 sees 24 zeros plus the first 24 samples, and
+        its bin 255 the last 24 samples plus 24 zeros; the global STFT has real
+        neighbouring data there instead. Both bins are recomputed from the
+        half-zeroed segments, using scipy's own periodic Hann window scaled by
+        1/sum(win) to match its 'spectrum' scaling. The result is bit-identical
+        to the per-window version, zero-padding artefacts included, which is what
+        the model was trained on.
+
+        Requires shift_samples to be a whole number of STFT hops (asserted);
+        3072 samples = 128 bins.
+
+        data_stack : np.ndarray (N, 3), columns in self.components order
+        starttime  : obspy.UTCDateTime of data_stack[0]
+        endtime    : obspy.UTCDateTime, unused, kept for signature parity
+
+        Returns tuple:
+            utc_start_list       list of UTCDateTime, start of each window
+                                 (starttime + i * shift_samples / fs)
+            stft_collection      np.ndarray (W, 64, 256, 6) float32, raw STFT
+            stft_norm_collection np.ndarray (W, 64, 256, 6) float32, normalised
+
+        W is 0 when data_stack is shorter than one window; callers must handle
+        the empty case. At 24 h / 100 Hz this is ~12 s and ~2.1 GB for the two
+        collections, of which ~7 s is the normalisation loop.
+        """
+        logger.debug("")
+        hop = self.stft_parameters["nperseg"] - self.stft_parameters["noverlap"]  # 24
+
+        nperseg = self.stft_parameters["nperseg"]  # 48
+        nfft = self.stft_parameters["nfft"]  # 126
+        half_seg = nperseg // 2  # 24
+
+        assert self.shift_samples % hop == 0, \
+            "shift_samples must be a multiple of the STFT hop"
+
+        bins_per_shift = self.shift_samples // hop  # 128
+        bins_per_window = 256
+
+        win = scipy.signal.get_window('hann', nperseg)  # periodic — scipy's default
+        win = win / win.sum()
+
+
+        # num_windows = (data_stack.shape[0] - self.len_sample) // self.shift_samples + 1
+        num_windows = max(0, (data_stack.shape[0] - self.len_sample) // self.shift_samples + 1)
+        utc_start_list = [
+            starttime + i * self.shift_samples / self.stft_parameters["fs"]
+            for i in range(num_windows)
+        ]
+
+        # ── slice + fix edge bins ─────────────────────────────────────
+        stft_collection = np.zeros((num_windows, 64, 256, 6), dtype=np.float32)
+
+        for j in range(3):
+            _, _, Zxx = scipy.signal.stft(data_stack[:, j], **self.stft_parameters)
+
+
+            for i in range(num_windows):
+                bin_start = i * bins_per_shift
+                window_slice = Zxx[:, bin_start:bin_start + bins_per_window].copy()
+
+                s = i * self.shift_samples  # sample offset in data_stack
+
+                # recompute bin 0: [zeros(24) | signal[s:s+24]] × Hann → FFT
+                seg0 = np.zeros(nperseg)
+                seg0[half_seg:] = data_stack[s:s + half_seg, j]
+                seg0 *= win
+                window_slice[:, 0] = np.fft.rfft(seg0, n=nfft)
+
+                # recompute bin 255: [signal[s+6096:s+6120] | zeros(24)] × Hann → FFT
+                seg_end = np.zeros(nperseg)
+                end_idx = s + self.len_sample - half_seg
+                seg_end[:half_seg] = data_stack[end_idx:end_idx + half_seg, j]
+                seg_end *= win
+                window_slice[:, -1] = np.fft.rfft(seg_end, n=nfft)
+
+                stft_collection[i, :, :, j * 2] = window_slice.real
+                stft_collection[i, :, :, j * 2 + 1] = window_slice.imag
+
+            del Zxx
+
+        # ── normalize ─────────────────────────────────────────────────
+        stft_norm_collection = np.zeros_like(stft_collection)
+        for i in range(num_windows):
+            stft_norm_collection[i] = _normalize_stft_channels(
+                stft_collection[i],
+                quantile_range=(25, 75),
+                unit_variance=False,
+                limit=1000,
+            )
+
+        return (utc_start_list, stft_collection, stft_norm_collection)
+
 
     def _detect_event_signals(self, stft_norm_collection):
         """
-        Detect event signals using detection algorithm
-        """
+        First EQS pass: predict masks for every window and detect signals.
 
+        The mask array is collapsed into two timeseries by _get_mask_timeseries(),
+        one from the even-numbered windows and one from the odd ones, each a
+        continuous concatenation of 256-bin blocks. Peaks are found in both.
+        Even-stream positions are shifted back by bins_overlap (128) so both
+        streams share one coordinate system; this is exact because shift_samples
+        is 128 bins. The two peak lists are then merged by
+        _compare_arrays_time_overlap(), which keeps the higher-scoring of any
+        overlapping pair.
+
+        stft_norm_collection : np.ndarray (W, 64, 256, 6) float32
+
+        Returns tuple:
+            filtered_results np.ndarray (D, 5), one row per detection:
+                             [peak, start, end, score, maxval]. Columns 0–2 are
+                             BIN INDICES, not seconds. Even-derived rows come
+                             first, then unmatched odd rows, so rows are NOT in
+                             time order
+            origin           list of int, 0 if the row came from the even stream,
+                             1 if from the odd one
+            y_predict        np.ndarray (W, 64, 256, 3), EQS masks, all windows
+        """
+        #################
         logger.debug("")
         model_verbose = 0
 
-        y_predict = self.model.predict(stft_norm_collection.astype(np.float32),
+        y_predict = self.model.predict(stft_norm_collection, batch_size=32, # ORGIGINAL
                                        verbose=model_verbose)
-
 
         mask_timeseries_even, mask_timeseries_odd = \
             self._get_mask_timeseries(y_predict)
@@ -988,13 +1487,12 @@ class Denoiser(object):
         #  for max of time series (=at leats one bin with mask value>0.1)
 
         # account for 50% time shift
-        peak_info_even = self.get_peaks(mask_timeseries_even,
+        peak_info_even = self._get_peaks(mask_timeseries_even,
                                         threshold=self.min_peak_height,
                                         shift_correction=128)
-        peak_info_odd = self.get_peaks(mask_timeseries_odd,
+        peak_info_odd = self._get_peaks(mask_timeseries_odd,
                                        threshold=self.min_peak_height,
                                        shift_correction=0)
-
 
         filtered_results, origin = \
             self._compare_arrays_time_overlap(peak_info_even, peak_info_odd)
@@ -1007,13 +1505,38 @@ class Denoiser(object):
     def _select_data_and_mask(self, filtered_results, origin, y_predict,
                               stft_collection, selected_starttimes):
         """
-        if signal detected, make choice which stft window to use
-        """
+        Map each detection onto the STFT window that contains it.
 
-        logger.debug("")
+        The peak position is an index into the concatenated even or odd
+        timeseries, so it is split into a window index and a bin offset within
+        that window; even rows have their 128-bin correction added back first.
+        When a detection falls in the last few bins of a window, the next window
+        of the same parity is used and the offset reset to 0, so the signal does
+        not sit on the window edge.
+
+        Detections whose window index runs past the end of the prediction array
+        are dropped. The surviving rows of filtered_results are returned as
+        `kept`, so every returned list stays index-aligned; callers must use
+        `kept` from here on rather than the original filtered_results.
+
+        filtered_results    : np.ndarray (D, 5) from _detect_event_signals()
+        origin              : list of int (D,), 0 even / 1 odd
+        y_predict           : np.ndarray (W, 64, 256, 3), EQS masks
+        stft_collection     : np.ndarray (W, 64, 256, 6), raw STFT
+        selected_starttimes : list of UTCDateTime (W,), window start times
+
+        Returns tuple, all of length K ≤ D and index-aligned:
+            selected_masks  np.ndarray (K, 64, 256, 3)
+            selected_stft   np.ndarray (K, 64, 256, 6)
+            selected_utc    list of UTCDateTime, window start per detection
+            detection_start list of UTCDateTime, estimated signal start
+                            (window start + bin offset × self.bin_spacing)
+            kept            np.ndarray (K, 5), the surviving filtered_results
+        """
         # Select data and mask based on list
         selected_stft, selected_masks, selected_utc = [], [], []
-        detection_score, detection_start = [], []
+        detection_start = []
+        kept = []
 
         for filtered_result, even_odd in zip(filtered_results, origin):
             # check if "better" solution in even or odd-numbered row.
@@ -1029,9 +1552,6 @@ class Denoiser(object):
                 bin_start = 0
 
             if index_window >= len(y_predict):
-                logger.info(f"_select_data_and_mask: {len(detection_start)} selected from "
-                            f"{len(filtered_results)} detections "
-                            f"({len(filtered_results) - len(detection_start)} dropped: index out of range)")
                 continue
 
             selected_masks.append(y_predict[index_window])
@@ -1039,18 +1559,45 @@ class Denoiser(object):
             selected_utc.append(selected_starttimes[index_window])
             detection_start.append(selected_starttimes[index_window] +
                                    bin_start*self.bin_spacing)
-            detection_score.append(filtered_result[3])
+            kept.append(filtered_result)             # CHANGED: keep the full row
+
+        n_dropped = len(filtered_results) - len(kept)
+        if n_dropped:
+            logger.info(f"_select_data_and_mask: {n_dropped} of {len(filtered_results)} "
+                        f"detections dropped (index out of range)")
 
         selected_masks = np.array(selected_masks)
         selected_stft = np.array(selected_stft)
         return (selected_masks, selected_stft, selected_utc,
-                detection_start, detection_score)
+                detection_start, np.array(kept))
+
+        # return (selected_masks, selected_stft, selected_utc,
+        #         detection_start, detection_score)
 
     def _recompute_mask(self, detection_start, starttime, data_stack):
         """
-        For detected signal, make optimised detection choosing optimal window
-        """
+        Re-cut each detection window so the signal starts at a known bin.
 
+        The window is moved so the estimated signal start falls 42 bins (10.08 s)
+        in, which keeps the onset away from the window edge and near the position
+        the model saw most often in training. The window is cut from data_stack,
+        then re-STFTed by _process_segment().
+
+        Windows that would run past either end of data_stack are skipped: their
+        entry in stream_start_end is None and their STFT rows stay zero.
+        _make_final_selection() checks for None and falls back to the original
+        window, so the detection is not lost.
+
+        detection_start : list of UTCDateTime (D,), estimated signal starts
+        starttime       : UTCDateTime of data_stack[0]
+        data_stack      : np.ndarray (N, 3)
+
+        Returns tuple, all of length D:
+            stft_collection_subset      np.ndarray (D, 64, 256, 6) float32
+            stft_norm_collection_subset np.ndarray (D, 64, 256, 6) float32
+            stream_start_end            list of (UTCDateTime, UTCDateTime) or
+                                        None, the re-aligned window bounds
+        """
         logger.debug("")
         # 10  # trying to align estimated signal start with binning
         shift_seconds = self.bin_spacing*42
@@ -1063,7 +1610,7 @@ class Denoiser(object):
         for i, _utc in enumerate(detection_start):
             # find start and end index
             startidx = int((_utc - starttime - shift_seconds) * self.stft_parameters["fs"])
-            endidx = startidx + 6120
+            endidx = startidx + self.len_sample
             # new_window_start.append(_utc-shift_seconds)
             data_window = data_stack[startidx:endidx, :]
             if len(data_window) < self.len_sample:
@@ -1086,7 +1633,43 @@ class Denoiser(object):
                               selected_masks, selected_utc,
                               stft_collection_subset, stream_start_end):# , denoised_hyb=None):
         """
-        Choose the best out of all computed results for a given earthquake.
+        Decide, per detection, whether to keep the original or the re-aligned
+        window, and drop everything below the acceptance threshold.
+
+        For each re-aligned window the mask timeseries is rebuilt and peaks are
+        found. The re-aligned window replaces the original only when it was
+        computed at all (stream_start_end[i] is not None) and its score exceeds
+        REALIGN_SCORE_TOLERANCE times the original score. Whichever window wins
+        must then score above self.threshold to be accepted.
+
+        The signal window is derived differently in the two cases: the original
+        path uses the first-pass onset and end bins, the re-aligned path the
+        onset and end bins of the new peak. Both convert bins to seconds with
+        "× self.bin_spacing" — filtered_results columns 1 and 2 are bin indices,
+        so the multiplication is required (this was a unit bug before).
+
+        All inputs must be index-aligned, which the `kept` return of
+        _select_data_and_mask() guarantees.
+
+        y_predict_event        : np.ndarray (D, 64, 256, 3), second-pass masks
+        filtered_results       : np.ndarray (D, 5), the `kept` rows
+        detection_start        : list of UTCDateTime (D,)
+        selected_stft          : np.ndarray (D, 64, 256, 6), original windows
+        selected_masks         : np.ndarray (D, 64, 256, 3), original masks
+        selected_utc           : list of UTCDateTime (D,), original window starts
+        stft_collection_subset : np.ndarray (D, 64, 256, 6), re-aligned windows
+        stream_start_end       : list of (UTCDateTime, UTCDateTime) or None (D,)
+
+        Returns tuple, all of length A ≤ D:
+            stft_final_subset      np.ndarray (A, 64, 256, 6)
+            masks_subset           np.ndarray (A, 64, 256, 3)
+            utc_start_subset       list of UTCDateTime, window start per detection
+            stream_start_end_final list of (UTCDateTime, UTCDateTime), signal
+                                   start and end per detection
+            scores_final           list of float, accepted score per detection
+
+        When nothing is accepted, empty arrays of the right shape and three empty
+        lists are returned.
         """
 
         logger.debug("")
@@ -1097,7 +1680,7 @@ class Denoiser(object):
             _timeseries = (2 * np.max(y_event[:, :, 0], axis=0) +
                            np.max(y_event[:, :, 1], axis=0) +
                            np.max(y_event[:, :, 2], axis=0)) / 4
-            _peak = self.get_peaks(_timeseries,
+            _peak = self._get_peaks(_timeseries,
                                    threshold=self.min_peak_height,
                                    shift_correction=0)
             keep_old = True
@@ -1113,19 +1696,24 @@ class Denoiser(object):
                 elif _peak[0][3] > self.REALIGN_SCORE_TOLERANCE * filtered_results[i][3]:
                     _score = _peak[0][3]
                     keep_old = False
+                # print("CHECK REALIGN_SCORE_TOLERANCE")
 
             if _score > self.threshold:
                 if keep_old:
                     stft_final_subset.append(selected_stft[i])
                     masks_subset.append(selected_masks[i])
                     utc_start_subset.append(selected_utc[i])
-                    detect_duration = filtered_results[i][2] -\
-                        filtered_results[i][1]
+                    # detect_duration = filtered_results[i][2] -\  # ORIGINAL
+                    #     filtered_results[i][1]
+                    detect_duration = (filtered_results[i][2] - filtered_results[i][1]) * self.bin_spacing # NEW / CORRECTION
+
+
                     stream_start_end_final.append((detection_start[i],
                                                    detection_start[i] +
                                                    detect_duration))
                     scores_final.append(_score)
                 else:
+
                     stft_final_subset.append(stft_collection_subset[i])
                     masks_subset.append(y_event)
                     utc_start_subset.append(stream_start_end[i][0])
@@ -1135,6 +1723,8 @@ class Denoiser(object):
                                                    stream_start_end[i][0] +
                                                    _peak[0][2] *
                                                    self.bin_spacing])
+
+
                     scores_final.append(_score)
         masks_subset = np.array(masks_subset)
         stft_final_subset = np.array(stft_final_subset)
@@ -1144,6 +1734,7 @@ class Denoiser(object):
                     np.zeros((0, 64, 256, 3), dtype=np.float32),
                     [], [], [])  # NEW []
 
+
         return stft_final_subset, masks_subset, utc_start_subset, stream_start_end_final, scores_final  # NEW
 
 
@@ -1151,8 +1742,30 @@ class Denoiser(object):
                        utc_start_subset, stream_start_end_final,
                        data, denoised_hyb=None):
         """
-        Build denoised ObsPy Stream from selected windows.
-        Uses denoised_hyb if provided (EQShyb path), otherwise ISTFT of masked STFT (EQS path).
+        Turn accepted detections into an ObsPy Stream of denoised snippets.
+
+        With denoised_hyb given, its waveforms are used directly (EQShyb path);
+        otherwise each component is reconstructed by ISTFT of the masked STFT
+        (EQS path). Both produce len_sample samples starting at the window start,
+        in float32.
+
+        Traces are grouped Z/N/E per detection in self.components order, and the
+        groups are sorted by signal start (stream_start_end_final[i][0]), not by
+        window start. Everything downstream relies on the triples staying
+        contiguous and in this order.
+
+        stft_final_subset      : np.ndarray (A, 64, 256, 6), raw STFT
+        masks_subset           : np.ndarray (A, 64, 256, 3), EQS masks
+        utc_start_subset       : list of UTCDateTime (A,), window starts
+        stream_start_end_final : list of (UTCDateTime, UTCDateTime) (A,)
+        data                   : obspy.Stream, source of the trace headers
+        denoised_hyb           : np.ndarray (A, 6120, 3) or None
+
+        Returns tuple:
+            trimmed_streams        obspy.Stream, 3*A traces, sorted by signal
+                                   start, Z/N/E contiguous per detection
+            stream_start_end_final list of (UTCDateTime, UTCDateTime), sorted
+                                   the same way
         """
         logger.debug("")
         num = stft_final_subset.shape[0]
@@ -1198,6 +1811,11 @@ class Denoiser(object):
         standardizes it, applies EQS mask to get stage-1 denoised waveform,
         then runs the hybrid model on both inputs alongside the EQS mask.
 
+        The two model inputs are normalised the way EQS2 was trained: the noisy
+        waveform is demeaned per channel and divided by one std per detection
+        (over all three components), and the EQS stage-1 waveform is divided by
+        that same std without demeaning. The output is rescaled by the same std,
+        so the result is back in physical units.
         Parameters
         ----------
         stft_final_subset : np.ndarray, shape (N, 64, 256, 6)
@@ -1270,9 +1888,37 @@ class Denoiser(object):
         logger.debug(f"EQShyb applied to {num} detections")
         return denoised_hyb
 
-    def _output(self, starttime, trimmed_streams, gap_intervals):
+    def _output(self, starttime, trimmed_streams, gap_intervals, data_raw=None):
         """
-        Writes results to the disk, print output, might also plot etc.
+        Write the denoised snippets, and optionally the restituted input, to
+        MiniSEED.
+
+        Traces are regrouped by component so each component's snippets are
+        contiguous, then Stream._cleanup() merges any that are exactly adjacent
+        (or that overlap with identical samples). This means the number of traces
+        in the file is not necessarily the number of detections. Samples inside
+        recorded gaps are then zeroed, since the model produces output there from
+        zero-filled input.
+
+        When self.pad_seconds > 0, each trace is additionally extended backwards
+        with zeros by that many seconds, clamped so it never reaches into the
+        previous trace of the same channel (one sample of separation is kept).
+        This gives downstream systems such as SeisComP some lead-in before each
+        onset. The clamp state is local to this call, so padding does not carry
+        across processing windows.
+
+        Output goes to <model parent>/DOY<julday>/, FLOAT32 encoded:
+            <stream_id>_denoised.mseed   always
+            <stream_id>_raw.mseed        only if data_raw is given and
+                                         self.save_raw is True
+
+        starttime       : UTCDateTime, used for the DOY folder name — pass the
+                          same value to _save_picks() so both land together
+        trimmed_streams : obspy.Stream, 3*A traces, Z/N/E contiguous
+        gap_intervals   : list of (UTCDateTime, UTCDateTime) from _get_data()
+        data_raw        : obspy.Stream or None, the restituted input to archive
+
+        Returns : None. Returns early without writing when the stream is empty.
         """
 
         logger.debug("")
@@ -1307,6 +1953,20 @@ class Denoiser(object):
                                      f"{gap_start} — {gap_end} "
                                      f"(samples {i_start}:{i_end})")
 
+
+        # ── START NEW PART prepend zero-padding to each trace ───────────────────────────
+        if self.pad_seconds > 0:
+            output_stream.sort(keys=['channel', 'starttime'])
+            prev_end = {}
+            for tr in output_stream:
+                pad_start = tr.stats.starttime - self.pad_seconds
+                if tr.id in prev_end:
+                    pad_start = max(pad_start,
+                                    prev_end[tr.id] + self.one_sample_s)
+                prev_end[tr.id] = tr.stats.endtime
+                tr.trim(starttime=pad_start, pad=True, fill_value=0)
+        # ── END OF NEW PART ───────────────────────────
+
         dir_tmp = str(Path(self.model_name).parent /
                       ("DOY" + str(starttime.julday).zfill(3))) + "/"
         check_dir(dir_tmp)
@@ -1319,7 +1979,46 @@ class Denoiser(object):
                             "_denoised.mseed",
                             format="MSEED", encoding="FLOAT32")
 
+        if data_raw is not None and getattr(self, "save_raw", False):
+            data_raw.write(dir_tmp + data_raw[0].id[:-1] + "_raw.mseed",
+                           format="MSEED", encoding="FLOAT32")
+
     def _trim_streams(self, trimmed_streams, startstop):
+        """
+        Resolve overlaps between consecutive detection snippets.
+
+        Each snippet is 61.2 s long, so neighbouring detections often overlap even
+        when their signals do not. Walking through the detections in order, four
+        cases are handled:
+
+          1. the traces do not overlap at all           → keep unchanged
+          2. traces overlap but this signal ends before
+             the next trace starts                      → cut at this signal end
+          3. traces and signals overlap, but the gap to
+             the next signal exceeds signal_buffer_s    → cut at this signal end,
+                                                          and start the next
+                                                          snippet signal_buffer_s
+                                                          before its own signal
+          4. the signals themselves overlap             → cut signal_buffer_s
+                                                          before the next signal,
+                                                          and start the next
+                                                          snippet there
+
+        Cases 3 and 4 modify the following triple in place inside trimmed_streams,
+        so each detection is only ever cut once. The last detection is appended
+        untouched.
+
+        Requires trimmed_streams sorted by signal start with Z/N/E contiguous per
+        detection, and startstop index-aligned with it — both guaranteed by
+        _build_streams() and _filter_close_detections_streams(). startstop[i][1]
+        (the signal end) is read here, so its units matter: see
+        _make_final_selection().
+
+        trimmed_streams : obspy.Stream, 3*A traces
+        startstop       : list of (UTCDateTime, UTCDateTime) (A,), signal bounds
+
+        Returns : obspy.Stream, the trimmed snippets in the same order
+        """
         logger.debug("")
         new_trimmed_stream = obspy.core.Stream()
 
@@ -1344,17 +2043,17 @@ class Denoiser(object):
             if tr_i.stats.endtime < tr_next.stats.starttime:
                 for comp in self.components:
                     new_trimmed_stream += triple_i.select(component=comp)[0]
-                logger.debug("No overlap")
+                # logger.debug("No overlap")
                 continue
 
             if startstop[i][1] < tr_next.stats.starttime:
-                logger.debug("No signal overlap with next stream")
+                # logger.debug("No signal overlap with next stream")
                 for comp in self.components:
                     new_trimmed_stream += triple_i.select(component=comp)[0].slice(
                         endtime=startstop[i][1] - one_sample)
 
             elif startstop[i][1] + buf < startstop[i + 1][0]:
-                logger.debug("No signal overlap")
+                # logger.debug("No signal overlap")
                 for comp in self.components:
                     ################
                     slice_end = startstop[i][1] - one_sample
@@ -1416,6 +2115,13 @@ class Denoiser(object):
         to the previous detection, keeping the higher-scoring one.
         Operates on already-sorted trimmed_streams and stream_start_end_final
         from _build_streams().
+        Detections closer than signal_buffer_s cannot be separated by
+        _trim_streams(), which would produce zero-length slices, so one of each
+        pair is dropped here. Comparison is always against the last kept
+        detection, so a chain of close detections collapses to its best member.
+
+        Returns (filtered_streams, filtered_startstop), index-aligned and still
+        sorted by signal start.
         """
         if len(stream_start_end_final) <= 1:
             return trimmed_streams, stream_start_end_final
@@ -1566,28 +2272,33 @@ class Denoiser(object):
         return picks_median_utc, results
 
 
-    def _stream_tta(self, _event_stream, _noise_stream, id=0,
+    def _stream_tta(self, _event_stream, _noise_std, id=0, # ORIGINAL
                     white_noise_factor=0.01):
         """
         Apply one TTA augmentation by injecting amplitude-scaled white noise.
-        The noise amplitude envelope is derived from _noise_stream (designaled noise)
-        via std — white Gaussian noise is then scaled by that envelope.
-        Each id produces a different but fully reproducible noise realisation.
+
+        The per-component noise levels are computed once per detection by
+        _process_snippet() from the designaled noise, trimmed to the unpadded
+        window, and passed in here as plain numbers. Each id produces a different
+        but fully reproducible noise realisation, and is also written into
+        stats.location so the annotations can be grouped by repetition later.
 
         _event_stream     : obspy.Stream, denoised event waveforms (Z/N/E)
-        _noise_stream     : obspy.Stream, designaled noise for amplitude scaling
-        id                : int, TTA index — seeds the RNG for reproducibility
-        white_noise_factor: float, global scaling of injected noise amplitude
-        Returns           : obspy.Stream, augmented event stream
+        _noise_std        : sequence of float, one std per component, in
+                            self.components order
+        id                : int, TTA index — seeds the RNG and becomes the
+                            2-digit location code
+        white_noise_factor: float, global scaling of the injected noise
+
+        Returns : obspy.Stream, augmented copy of _event_stream
         """
         _event_noiseinjected = _event_stream.copy()
         # seed by id — same id always produces same noise sequence
         rng = np.random.default_rng(seed=id)
-        for comp in self.components:
+        for comp, noise_std_comp in zip(self.components, _noise_std):
             tr_denoised = _event_noiseinjected.select(component=comp)[0]
-            tr_noise = _noise_stream.select(component=comp)[0]
             tr_denoised.data += (white_noise_factor
-                                 * np.std(tr_noise.data)
+                                 * noise_std_comp
                                  * rng.standard_normal(len(tr_denoised.data)))
             tr_denoised.stats.location = str(id).zfill(2)
         return _event_noiseinjected
@@ -1662,6 +2373,11 @@ class Denoiser(object):
         annotates them all in one batch, clusters picks, and computes uncertainty.
         Optionally runs polarity prediction on each accepted P pick using the
         same TTA collection (no re-augmentation needed).
+        The three traces are copied before being padded by `add` seconds on each
+        side. The padding gives the picker room to slide its window past arrivals
+        near the snippet edges, and the copy keeps that padding out of
+        trimmed_streams, which is written to disk later. The noise std is computed
+        on the unpadded window, so the zero padding cannot dilute it.
 
         event_streams  : tuple of (tr_Z, tr_N, tr_E) obspy.Trace objects
         st_designaled  : obspy.Stream, per-snippet designaled noise for TTA
@@ -1675,31 +2391,40 @@ class Denoiser(object):
                          Pick.polarity when self.polarity_model is not None;
                          S picks always have Pick.polarity = None.
         """
-        _st_z, _st_1, _st_2 = event_streams
-
-        add = 5 if _st_z.stats.npts >= 6120 else 5 + (6120 - _st_z.stats.npts) / 200
-        for st in (_st_z, _st_1, _st_2):
-            st.trim(st.stats.starttime - add, st.stats.endtime + add,
-                    pad=True, fill_value=0)
-
+        # compute noise std per component
         _noise = obspy.core.Stream([
             st_designaled.select(component=c)[0].copy()
             for c in self.components
         ])
+        _st_z, _st_1, _st_2 = [tr.copy() for tr in event_streams]  #
+        n_start, n_end = _st_z.stats.starttime, _st_z.stats.endtime
+        for tr in _noise: # select noise before paddign for std comp.
+            tr.trim(n_start, n_end, pad=True, fill_value=0)
 
-        _start, _end = _st_z.stats.starttime, _st_z.stats.endtime
-        for tr in _noise:
-            tr.trim(_start, _end, pad=True, fill_value=0)
+        add = 5 if _st_z.stats.npts >= 6120 else 5 + (6120 - _st_z.stats.npts) / 200
+        # make longer for seisbench picker, white noise added to 0s part with TTA
+        for st in (_st_z, _st_1, _st_2):
+            st.trim(st.stats.starttime - add, st.stats.endtime + add,
+                    pad=True, fill_value=0)
+        _start, _end = _st_z.stats.starttime, _st_z.stats.endtime   # padded start/end for annotations
 
         event_tta_collection = Stream()
-        for i in range(repeat):
+        # compute noise std once here for all TTA repeats
+        noise_std_3comp = [
+            np.std(_noise.select(component=comp)[0].data)
+            for comp in self.components
+        ]
+
+        for i in range(repeat):  # per detection/waveform -> return 20 copies noise-augmented
             event_tta_collection += self._stream_tta(
-                Stream([_st_z, _st_1, _st_2]), _noise,
+                Stream([_st_z, _st_1, _st_2]), _noise_std=noise_std_3comp,
                 id=i, white_noise_factor=0.01)
+
 
         annotations = self.picker.annotate(event_tta_collection, batch_size=repeat)
         annotations.sort(keys=['location'])
         annotations.trim(_start, _end, pad=True, fill_value=0)
+
 
         picks_current_tta = self.picker.classify_aggregate(annotations, argdict={}).picks
         p_picks_tta = picks_current_tta.select(min_confidence=p_confidence, phase="P")
@@ -1737,6 +2462,7 @@ class Denoiser(object):
                     p_pick=p_median,
                     polarity_model=self.polarity_model,
                     threshold=self.polarity_threshold,
+                    training=self.polarity_mc_dropout
                 )
             p_picks.append(Pick(
                 time=p_median,
@@ -1753,83 +2479,63 @@ class Denoiser(object):
 
         return {'p_picks': p_picks, 's_picks': s_picks}
 
-    def _process_picks(self, st_denoised, st_designaled,
-                       repeat=20, pick_tolerance=1,
-                       p_confidence=0.5, s_confidence=0.5,
-                       min_share_models=0.25):
-        """
-        Parallel TTA picking loop over all detected event snippets.
-        Processes each Z/N/E triple independently via ThreadPoolExecutor.
-        Results are collected via as_completed(); pick order in the output
-        lists is non-deterministic but irrelevant since each Pick carries
-        an absolute UTC time and event_id.
 
-        st_denoised      : obspy.Stream, denoised snippets (Z/N/E triples)
-        st_designaled    : obspy.Stream, per-snippet designaled noise for TTA
-                           amplitude scaling, aligned to st_denoised
-                           (same number of Z/N/E triples)
-        repeat           : int, number of TTA augmentations per snippet
-        pick_tolerance   : float, pick clustering tolerance (s)
-        p_confidence     : float, min picker confidence to accept a P pick
-        s_confidence     : float, min picker confidence to accept an S pick
-        min_share_models : float, min fraction of TTA repetitions that must
-                           exceed the confidence threshold for a pick to be kept
-        Returns          : dict with keys 'p_picks' and 's_picks', each a list
-                           of Pick objects with share > min_share_models
+
+    def _process_picks(self, snippet_jobs,  # NEW
+                           repeat=20, pick_tolerance=1,
+                           p_confidence=0.5, s_confidence=0.5,
+                           min_share_models=0.25,
+                           max_workers=None):
+        """
+        Run TTA picking over pre-paired (snippet, noise) jobs.
+
+        _pick() builds the pairs, so no positional re-matching is needed here and
+        the pairing cannot shift when a detection is missing its noise.
+
+        snippet_jobs : list of (event_triple, noise_stream); event_triple is an
+                       obspy.Stream of exactly 3 traces (Z/N/E) and noise_stream
+                       the matching designaled noise of equal length and
+                       starttime
+        max_workers  : int or None; None uses self.pick_workers. Kept at 1 by
+                       default, since thread scheduling changes the TTA ordering
+                       and therefore the picks
+
+        Returns dict with 'p_picks' and 's_picks', each a list of Pick objects
+        accumulated over all jobs.
         """
         all_results = {'p_picks': [], 's_picks': []}
+        workers = max_workers or self.pick_workers
 
-        # sort both streams by starttime so Z/N/E triples zip correctly
-        st_denoised.sort(keys=['starttime'])
-        st_designaled.sort(keys=['starttime'])
+        if workers == 1:
+            results = [self._process_snippet(event_streams, noise_stream,
+                                             repeat, pick_tolerance, p_confidence, s_confidence)
+                       for event_streams, noise_stream in snippet_jobs]      # ◀ CHANGED: iterate tuples directly
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(self._process_snippet, event_streams, noise_stream,
+                                           repeat, pick_tolerance, p_confidence, s_confidence)
+                           for event_streams, noise_stream in snippet_jobs]  # ◀ CHANGED: iterate tuples directly
+                results = [f.result() for f in futures]
 
-        # explicit component selection + sort ensures deterministic pairing
-        st_z_list = sorted(st_denoised.select(component=self.components[0]),
-                           key=lambda tr: tr.stats.starttime)
-        st_1_list = sorted(st_denoised.select(component=self.components[1]),
-                           key=lambda tr: tr.stats.starttime)
-        st_2_list = sorted(st_denoised.select(component=self.components[2]),
-                           key=lambda tr: tr.stats.starttime)
-
-        event_streams_list = list(zip(st_z_list, st_1_list, st_2_list))
-        designaled_streams_list = [st_designaled[3 * i: 3 * (i + 1)]
-                                   for i in range(len(event_streams_list))]
-
-        assert len(event_streams_list) == len(designaled_streams_list), (
-            f"Mismatch: {len(event_streams_list)} event streams vs "
-            f"{len(designaled_streams_list)} designaled streams"
-        )
-
-        with ThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(
-                    self._process_snippet,
-                    event_streams,
-                    designaled_stream,
-                    repeat, pick_tolerance,
-                    p_confidence, s_confidence
-                )
-                # for event_streams in event_streams_list
-                for event_streams, designaled_stream in zip(event_streams_list, designaled_streams_list)
-            ]
-            # for future in futures:
-            for future in as_completed(futures):  # should be fine here
-                result = future.result()
-                all_results['p_picks'].extend(result['p_picks'])
-                all_results['s_picks'].extend(result['s_picks'])
+        for result in results:
+            all_results['p_picks'].extend(result['p_picks'])
+            all_results['s_picks'].extend(result['s_picks'])
 
         all_results['p_picks'] = [p for p in all_results['p_picks'] if p.share > min_share_models]
         all_results['s_picks'] = [p for p in all_results['s_picks'] if p.share > min_share_models]
 
         return all_results
 
-
-    def _pick(self, trimmed_streams, data_original):
+    def _pick(self, trimmed_streams, data_original):  # NEW
         """
         Run phase picking on denoised event snippets using TTA.
         Computes per-snippet designaled noise (original - denoised) to provide
         the amplitude info for TTA white noise scaling. Memory cost scales
         with number of detections x snippet length.
+        Every detection contributes exactly one (snippet, noise) pair, so the
+        pairing in _process_picks() cannot shift. Zero-length snippets and failed
+        noise computations both get a zero-filled placeholder rather than being
+        skipped.
 
         trimmed_streams : obspy.Stream
             Denoised event snippets from _trim_streams(), Z/N/E per detection.
@@ -1845,44 +2551,36 @@ class Denoiser(object):
         # logger.debug(f"_pick: data_original has {len(data_original)} traces: "
         #              f"{[tr.stats.channel for tr in data_original]}")
 
-        if not len(trimmed_streams):
-            logger.info("No denoised snippets — skipping picking")
-            return {'p_picks': [], 's_picks': []}
 
+        num_detections = len(trimmed_streams) // 3
+        snippet_jobs = []
         data_start = data_original[0].stats.starttime
         data_end = data_original[0].stats.endtime
 
-        num_detections = len(trimmed_streams) // 3
-        st_designaled_snippets = obspy.core.Stream()
-
         for i in range(num_detections):
             snippet = trimmed_streams[3 * i: 3 * (i + 1)]
-            # logger.debug(f"Detection {i}: snippet components = "
-            #              f"{[tr.stats.channel for tr in snippet]}, "
-            #              f"npts = {[tr.stats.npts for tr in snippet]}")
-
             tr_ref = snippet.select(component=self.components[0])[0]
-            if tr_ref.stats.npts == 0:  # TODO check why this happens
-                logger.warning(f"Detection {i}: zero-length snippet — skipping")
+
+            event_triple = tuple(snippet.select(component=c)[0]
+                                 for c in self.components)  # where
+
+            if tr_ref.stats.npts == 0:
+                logger.warning(f"Detection {i}: zero-length snippet — using zero noise")
+                noise_snippet = obspy.core.Stream()
+                for tr in snippet:
+                    zero_tr = tr.copy()
+                    zero_tr.data = np.zeros_like(tr.data)
+                    noise_snippet += zero_tr
+                snippet_jobs.append((event_triple, noise_snippet))
                 continue
 
-            # start = tr_ref.stats.starttime
-            # end = tr_ref.stats.endtime
             start = max(tr_ref.stats.starttime, data_start)  # clamp
             end = min(tr_ref.stats.endtime, data_end)  # clam
             npts = tr_ref.stats.npts
 
-            # slice original to same window — tr.slice() avoids copying full day
             original_snippet = obspy.core.Stream()
-
             for tr in data_original:
                 tr_sliced = tr.slice(start, end)
-                # logger.debug(f"_pick slice: tr={tr.id} "
-                #              f"data={tr.stats.starttime}—{tr.stats.endtime} "
-                #              f"slice={start}—{end} "
-                #              f"result_npts={tr_sliced.stats.npts} "
-                #              f"expected_npts={npts}")
-
                 if tr_sliced.stats.npts != npts:
                     tr_sliced = tr_sliced.trim(
                         start,
@@ -1898,22 +2596,22 @@ class Denoiser(object):
             if len(noise_snippet) == 0:
                 logger.warning(f"Detection {i}: _get_designaled_noise failed — "
                                f"using zero noise for this snippet")
-                # zero-fill to preserve index alignment with trimmed_streams
+                noise_snippet = obspy.core.Stream()                # ◀ CHANGED: local stream
                 for tr in snippet:
                     zero_tr = tr.copy()
                     zero_tr.data = np.zeros_like(tr.data)
-                    st_designaled_snippets += zero_tr
-            else:
-                st_designaled_snippets += noise_snippet
+                    noise_snippet += zero_tr
 
-        picks = self._process_picks(
-            st_denoised=trimmed_streams,
-            st_designaled=st_designaled_snippets,
-            **self.picking_kwargs
-        )
+            snippet_jobs.append((event_triple, noise_snippet))
+
+
+        picks = self._process_picks(snippet_jobs, **self.picking_kwargs)
+
         logger.info(f"Picks: {len(picks['p_picks'])} P, "
                     f"{len(picks['s_picks'])} S")
         return picks
+
+
 
     def _save_picks(self, picks, starttime, stream_id=None):
         """
@@ -2072,16 +2770,24 @@ class Denoiser(object):
     def run_timerange(self, network, station, location, channel,
                       startday, endday):
         """
-        Run multiple days in one go. This optimises the running time as
-        repsonses only need to be computed once.
-        network: network code
-        station: station code
-        location: location code
-        channel: channel code
-        startday: first day which should be processed (obspy.core.UTCDateTime)
-        endday: last day which should be processed (obspy.core.UTCDateTime)
-        """
+        Process several days, overlapping download and computation.
 
+        A loader thread fetches one day at a time into a queue of size 1 while
+        this method runs the consumer loop in the calling thread, so the next day
+        downloads while the current one is processed. The response cache and the
+        loaded models are reused across days.
+
+        Both threads share this instance, so a run is still single-station.
+
+        network  : str, FDSN network code
+        station  : str, FDSN station code
+        location : str, FDSN location code (wildcards accepted)
+        channel  : str, 2-char channel prefix, e.g. "HH"
+        startday : obspy.UTCDateTime, first day to process
+        endday   : obspy.UTCDateTime, last day to process (inclusive)
+
+        Returns : None — results are written to disk per day by run_data()
+        """
         logger.debug("")
         day_queue = queue.Queue(maxsize=1)
         loader = threading.Thread(
@@ -2098,6 +2804,8 @@ class Denoiser(object):
         Adjust endtime so that (endtime - starttime) is a multiple of 61.2s.
         Rounds up to avoid losing the last partial window.
         window_s = len_sample / fs = 6120 / 100 = 61.2s
+        Rounding up means the last window may extend past the requested endtime;
+        _get_data() fetches self.buffer seconds beyond it anyway.
         """
         window_s = self.len_sample / self.stft_parameters["fs"]  # 61.2s
         duration = endtime - starttime
@@ -2107,78 +2815,96 @@ class Denoiser(object):
     def run_data(self, network, station, location, channel, starttime,
                  endtime, data=None):
         """
-        Principal method driving the full denoising pipeline for given
-        time window.
+        Run the full pipeline for one time window. Main entry point.
 
-        Fetches and restitutes waveforms, computes STFTs, runs the EQS
-        in two passes (detection + re-aligned refinement), optionally applies
-        the EQShyb time-domain model, assembles denoised streams, writes
-        MiniSEED to disk, and optionally runs TTA phase picking with pick
-                output as JSON and/or SC3ML (see pick_output).
+        Fetches and restitutes the waveforms, computes STFTs over sliding
+        windows, runs EQS twice (detection, then a re-aligned refinement),
+        optionally refines accepted detections with EQShyb, assembles and trims
+        the denoised snippets, optionally picks phases with TTA, and writes
+        MiniSEED plus pick files to disk. Each step is annotated inline with its
+        inputs and outputs.
+
+        Returns early, having written nothing, when the data cannot be fetched,
+        when no detection survives selection, or when none survives the proximity
+        filter.
 
         network   : str, FDSN network code
         station   : str, FDSN station code
-        location  : str, FDSN location code (wildcards accepted)
-        channel   : str, 2-char channel prefix, e.g. "HH" or "HG"
-                    (component wildcard appended internally)
+        location  : str, FDSN location code (wildcep detectionsards accepted)
+        channel   : str, 2-char channel prefix, e.g. "HH" or "HG" (the component
+                    wildcard is appended internally)
         starttime : obspy.UTCDateTime, start of the processing window
-        endtime   : obspy.UTCDateTime, requested end of the processing window;
-                    adjusted internally to the next exact multiple of 61.2 s
-        data      : obspy.Stream or None, pre-fetched raw waveforms;
-                    if None, data are fetched via self.data_client
-        Returns   : None — results are written to disk (MiniSEED + picks
-                            JSON and/or SC3ML, see pick_output)
+        endtime   : obspy.UTCDateTime, requested end; rounded up internally to
+                    the next exact multiple of 61.2 s
+        data      : obspy.Stream or None, pre-fetched raw waveforms including the
+                    self.buffer margin; fetched via self.data_client if None
+
+        Returns : None — everything is written to <model parent>/DOY<julday>/
         """
 
         logger.debug("")
 
-        # starttime and endtime should be multiples of 61.2s
+        # snap the window to whole model windows
         # IN:  starttime (UTCDateTime, start of processing window),
         #      endtime (UTCDateTime, requested end of processing window)
-        # OUT: endtime (UTCDateTime, adjusted so that endtime - starttime
-        #               is an exact multiple of 61.2s, rounded up)
+        # OUT: endtime (UTCDateTime, adjusted so that endtime - starttime is an
+        #               exact multiple of 61.2 s, rounded up — the last window
+        #               may therefore extend past the requested end)
         endtime = self._round_to_window(starttime, endtime)
 
 
-        # IN:  network, station, location, channel, starttime, endtime, data (optional raw Stream)
+        # fetch + restitute
+        # IN:  network, station, location, channel, starttime, endtime,
+        #      data (optional raw Stream, must already include the buffer)
         # OUT: data (Stream, 3 components, restituted, 100 Hz, buffer trimmed),
-        #      data_stack (np.ndarray, shape (N, 3), columns Z/N/E,
-        #                  restituted velocity waveforms in physical units),
-        #      gap_intervals (list of (UTCDateTime, UTCDateTime), gap start/end pairs
-        #                     recorded before merge — empty list if no gaps)
+        #      data_stack (np.ndarray, (N, 3), columns in self.components order
+        #                  (Z first), restituted velocity in m/s),
+        #      gap_intervals (list of (UTCDateTime, UTCDateTime), recorded before
+        #                     the merge zero-filled them — empty list if no gaps)
+        #      None when fewer than 3 traces survive the merge
         result = self._get_data(network, station, location, channel,
                                           starttime, endtime, data)
-
         if result is None:
             return None
         data, data_stack, gap_intervals = result
 
         # compute stfts
-        # IN:  data_stack (N, 3), starttime (UTCDateTime), endtime (UTCDateTime)
-        # OUT: selected_starttimes (list of UTCDateTime, one per valid window),
-        #      stft_collection (np.ndarray, shape (W, 64, 256, 6), raw STFT all windows),
-        #      stft_norm_collection (np.ndarray, shape (W, 64, 256, 6), normalised STFT)
+        # IN:  data_stack (N, 3), data[0].stats.starttime (UTCDateTime,
+        #      time of data_stack[0]), endtime (UTCDateTime, unused)
+        # OUT: selected_starttimes (list of UTCDateTime, W, window start times,
+        #                           spaced self.shift_samples / fs apart),
+        #      stft_collection (np.ndarray, (W, 64, 256, 6) float32, raw STFT),
+        #      stft_norm_collection (np.ndarray, (W, 64, 256, 6) float32, normalised)
+        #      W = 0 if the record is shorter than one 61.2 s window
         selected_starttimes, stft_collection, stft_norm_collection =  \
-            self._compute_stfts(data_stack, data[0].stats.starttime, endtime)
+            self._compute_global_stfts(data_stack, data[0].stats.starttime, endtime)
 
-        # make prediction
+        # make prediction — EQS first pass + peak detection
         # IN:  stft_norm_collection (W, 64, 256, 6)
-        # OUT: filtered_results (np.ndarray, (D, 5), peak/start/end/score/maxval per detection),
-        #      origin (list of int, 0=even 1=odd stream for each detection),
-        #      y_predict (np.ndarray, (W, 64, 256, 3), EQS mask predictions all windows)
+        # OUT: filtered_results (np.ndarray, (D, 5), columns
+        #                        [peak, start, end, score, maxval]; columns 0-2 are
+        #                        BIN INDICES (0.24 s per bin), not seconds.
+        #                        Even-derived rows first, then unmatched odd rows,
+        #                        so the rows are NOT in time order),
+        #      origin (list of int, D, 0 = even stream, 1 = odd stream),
+        #      y_predict (np.ndarray, (W, 64, 256, 3), EQS masks, all windows)
         filtered_results, origin, y_predict = \
             self._detect_event_signals(stft_norm_collection)
 
-        # make selection
+
+        # make selection — map each detection onto its STFT window
         # IN:  filtered_results (D, 5), origin (D,), y_predict (W, 64, 256, 3),
         #      stft_collection (W, 64, 256, 6), selected_starttimes (list, W)
-        # OUT: selected_masks (np.ndarray, (D, 64, 256, 3), EQS mask per detection),
-        #      selected_stft (np.ndarray, (D, 64, 256, 6), raw STFT per detection),
-        #      selected_utc (list of UTCDateTime, window start per detection),
-        #      detection_start (list of UTCDateTime, estimated signal start per detection),
-        #      detection_score (list of float, score per detection)
+        # OUT: selected_masks (np.ndarray, (K, 64, 256, 3), EQS mask per detection),
+        #      selected_stft (np.ndarray, (K, 64, 256, 6), raw STFT per detection),
+        #      selected_utc (list of UTCDateTime, K, window start per detection),
+        #      detection_start (list of UTCDateTime, K, estimated signal start),
+        #      filtered_results (np.ndarray, (K, 5), ONLY the rows that survived;
+        #                        detections whose window index ran past the end of
+        #                        y_predict are dropped here, so the original array
+        #                        must not be used from this point on. K <= D)
         selected_masks, selected_stft, selected_utc, detection_start, \
-            detection_score = \
+            filtered_results = \
             self._select_data_and_mask(filtered_results, origin, y_predict,
                                        stft_collection, selected_starttimes)
 
@@ -2186,39 +2912,49 @@ class Denoiser(object):
             logger.info("No detections found — skipping refinement and output")
             return None
 
-        # recompute mask
-        # IN:  detection_start (list of UTCDateTime, D),
+
+        # free the full-record arrays: only the per-detection subsets are needed
+        # from here on
+        del stft_collection, stft_norm_collection, y_predict
+
+        # recompute mask — re-cut each window so the onset sits 10.08 s in
+        # IN:  detection_start (list of UTCDateTime, K),
         #      data[0].stats.starttime (UTCDateTime, reference for sample indexing),
         #      data_stack (N, 3)
-        # OUT: stft_collection_subset (np.ndarray, (D, 64, 256, 6), re-aligned raw STFT),
-        #      stft_norm_collection_subset (np.ndarray, (D, 64, 256, 6), re-aligned norm STFT),
-        #      stream_start_end (list of (UTCDateTime, UTCDateTime) or None, D,
-        #                        None where window was skipped due to insufficient data)
+        # OUT: stft_collection_subset (np.ndarray, (K, 64, 256, 6), re-aligned raw STFT),
+        #      stft_norm_collection_subset (np.ndarray, (K, 64, 256, 6), re-aligned norm),
+        #      stream_start_end (list of (UTCDateTime, UTCDateTime) or None, K;
+        #                        None where the re-aligned window would fall outside
+        #                        data_stack — those rows stay zero and the original
+        #                        window is kept by _make_final_selection)
         stft_collection_subset, stft_norm_collection_subset, \
             stream_start_end = \
             self._recompute_mask(detection_start,
                                  data[0].stats.starttime,
                                  data_stack)
 
-        # Make new prediction
-        # IN:  stft_norm_collection_subset (D, 64, 256, 6)
-        # OUT: y_predict_event (np.ndarray, (D, 64, 256, 3), EQS mask re-aligned windows)
+        # Make new prediction — EQS second pass on the re-aligned windows
+        # IN:  stft_norm_collection_subset (K, 64, 256, 6)
+        # OUT: y_predict_event (np.ndarray, (K, 64, 256, 3), EQS masks)
         y_predict_event = self.model.predict(stft_norm_collection_subset,
                                              verbose=0)
 
-        # window selection — returns arrays needed for EQShyb
-        # IN:  y_predict_event (D, 64, 256, 3), filtered_results (D, 5),
-        #      detection_start (list, D), selected_stft (D, 64, 256, 6),
-        #      selected_masks (D, 64, 256, 3), selected_utc (list, D),
-        #      stft_collection_subset (D, 64, 256, 6),
-        #      stream_start_end (list of (UTCDateTime, UTCDateTime) or None, D)
-        # OUT: stft_final_subset (np.ndarray, (A, 64, 256, 6), raw STFT accepted detections),
-        #      masks_subset (np.ndarray, (A, 64, 256, 3), EQS mask accepted detections),
-        #      utc_start_subset (list of UTCDateTime, A, window start accepted detections),
+        # window selection — choose original vs re-aligned window, apply threshold
+        # IN:  y_predict_event (K, 64, 256, 3), filtered_results (K, 5),
+        #      detection_start (list, K), selected_stft (K, 64, 256, 6),
+        #      selected_masks (K, 64, 256, 3), selected_utc (list, K),
+        #      stft_collection_subset (K, 64, 256, 6),
+        #      stream_start_end (list of (UTCDateTime, UTCDateTime) or None, K)
+        #      all of these must stay index-aligned — guaranteed by the
+        #      filtered_results returned above
+        # OUT: stft_final_subset (np.ndarray, (A, 64, 256, 6), raw STFT accepted),
+        #      masks_subset (np.ndarray, (A, 64, 256, 3), EQS mask accepted),
+        #      utc_start_subset (list of UTCDateTime, A, window start accepted),
         #      stream_start_end_final (list of (UTCDateTime, UTCDateTime), A,
-        #                              signal start/end per accepted detection)
+        #                              signal start/end per accepted detection;
+        #                              bin counts converted with self.bin_spacing)
         #      scores_final (list of float, A, detection score per accepted detection)
-        #      A = number of accepted detections (<= D)
+        #      A = number of accepted detections (<= K)
         stft_final_subset, masks_subset, utc_start_subset, stream_start_end_final, scores_final = \
             self._make_final_selection(y_predict_event, filtered_results,
                                        detection_start, selected_stft,
@@ -2230,32 +2966,36 @@ class Denoiser(object):
         # IN:  stft_final_subset (A, 64, 256, 6), masks_subset (A, 64, 256, 3),
         #      utc_start_subset (list, A), data_stack (N, 3),
         #      data[0].stats.starttime (UTCDateTime, reference for sample indexing)
-        # OUT: denoised_hyb (np.ndarray, (A, 6120, 3), EQShyb denoised waveforms)
-        #      skipped if eqs2_model is None or no accepted detections
+        # OUT: denoised_hyb (np.ndarray, (A, 6120, 3), EQShyb denoised waveforms
+        #      in physical units), or None if eqs2_model is None or A == 0
         denoised_hyb = None
         if self.eqs2_model is not None and stft_final_subset.shape[0] > 0:
             denoised_hyb = self._apply_eqshyb(stft_final_subset, masks_subset,
                                               utc_start_subset, data_stack,
                                               data[0].stats.starttime)
 
+        # free the sample-domain array: _recompute_mask() and _apply_eqshyb()
+        # were its only consumers (~200 MB for a day at 100 Hz)
+        del data_stack
+
+        # assemble streams — ISTFT (EQS) or EQShyb waveforms
         # IN:  stft_final_subset (A, 64, 256, 6), masks_subset (A, 64, 256, 3),
         #      utc_start_subset (list, A), stream_start_end_final (list, A),
-        #      data (Stream, for trace metadata),
-        #      denoised_hyb (np.ndarray, (A, 6120, 3)) or None — if None uses EQS ISTFT path
-        # OUT: trimmed_streams (obspy.Stream, sorted denoised traces),
-        #      stream_start_end_final (list of (UTCDateTime, UTCDateTime), A, sorted)
+        #      data (Stream, source of the trace headers),
+        #      denoised_hyb (A, 6120, 3) or None — if None the EQS ISTFT path is used
+        # OUT: trimmed_streams (obspy.Stream, 3*A traces, Z/N/E contiguous per
+        #                       detection, groups sorted by SIGNAL start),
+        #      stream_start_end_final (list, A, sorted the same way)
         trimmed_streams, stream_start_end_final = \
             self._build_streams(stft_final_subset, masks_subset,
                                 utc_start_subset, stream_start_end_final,
                                 data, denoised_hyb)
 
 
-        # remove detections too close together to be resolved by _trim_streams
-        # IN:  trimmed_streams (obspy.Stream, sorted denoised traces),
-        #      stream_start_end_final (list of (UTCDateTime, UTCDateTime), A, sorted),
-        #      scores_final (list of float, A, detection score per accepted detection)
-        # OUT: trimmed_streams (obspy.Stream, duplicates removed, higher-scoring kept),
-        #      stream_start_end_final (list of (UTCDateTime, UTCDateTime), filtered)
+        # resolve overlaps between consecutive snippets, apply signal_buffer_s
+        # IN:  trimmed_streams (obspy.Stream), stream_start_end_final (list, A)
+        # OUT: trimmed_streams (obspy.Stream, snippets cut so that neighbouring
+        #                       detections no longer overlap)
         trimmed_streams, stream_start_end_final  = \
             self._filter_close_detections_streams(trimmed_streams, stream_start_end_final, scores_final)
 
@@ -2268,10 +3008,12 @@ class Denoiser(object):
         trimmed_streams = self._trim_streams(trimmed_streams, stream_start_end_final)  # NEW
 
         # phase picking — optional, only if picker configured and snippets exist
-        # IN:  trimmed_streams (obspy.Stream, denoised snippets only),
-        #      data (obspy.Stream, original restituted, in memory only — not re-fetched)
+        # IN:  trimmed_streams (obspy.Stream, denoised snippets),
+        #      data (obspy.Stream, original restituted, in memory — not re-fetched;
+        #            used to build the designaled noise for the TTA augmentation)
         # OUT: picks (dict, keys 'p_picks'/'s_picks', each a list of Pick objects),
-        #      picks written to disk as JSON and/or SC3ML per self.pick_output
+        #      and pick files written to disk as JSON and/or SC3ML per
+        #      self.pick_output, in the same DOY folder as the MiniSEED
         picks = None
         if self.picker is not None and len(trimmed_streams):
             picks = self._pick(trimmed_streams, data)
@@ -2279,20 +3021,84 @@ class Denoiser(object):
 
         # filter by pick — optional, only if filter_by_pick enabled and picks exist
         # IN:  trimmed_streams (obspy.Stream, overlap-trimmed denoised traces),
-        #      picks (dict, keys 'p_picks'/'s_picks', or None if picker not configured)
+        #      picks (dict, or None if the picker is not configured)
         # OUT: streams_to_save (obspy.Stream, subset of trimmed_streams whose time
-        #      window contains at least one accepted P or S pick;
-        #      equals trimmed_streams unchanged if filter_by_pick is False or picks
+        #      window contains at least one accepted P or S pick; equals
+        #      trimmed_streams unchanged when filter_by_pick is False or picks is None)
         streams_to_save = (
             self._filter_streams_by_picks(trimmed_streams, picks)
             if self.filter_by_pick and picks is not None
             else trimmed_streams)
 
         # output - save to MSEED
-        # IN:  data[0].stats.starttime (UTCDateTime, for output directory naming),
-        #      streams_to_save (obspy.Stream, overlap-trimmed denoised traces,
-        #                       optionally filtered to pick-confirmed detections only)
-        #      gap_intervals (list of (UTCDateTime, UTCDateTime), gap regions to zero-mask
-        #                    in output — empty list if no gaps)
-        # OUT: writes denoised MiniSEED to disk with gap regions zeroed, returns nothing
+        # IN:  data[0].stats.starttime (UTCDateTime, gives the DOY folder name —
+        #                               the same value is passed to _save_picks so
+        #                               both land together),
+        #      streams_to_save (obspy.Stream, the traces to write),
+        #      gap_intervals (list of (UTCDateTime, UTCDateTime), zeroed in the
+        #                     output because the model produces signal there from
+        #                     zero-filled input),
+        #      data (obspy.Stream, restituted input; written as <id>_raw.mseed
+        #            only when self.save_raw is True)
+        # OUT: writes <id>_denoised.mseed (and optionally <id>_raw.mseed) to
+        #      <model parent>/DOY<julday>/. Note that Stream._cleanup() merges
+        #      snippets that end up exactly contiguous, so the number of traces
+        #      in the file is not necessarily the number of detections.
         self._output(data[0].stats.starttime, streams_to_save, gap_intervals)
+# %%
+# %%
+if __name__ == "__main__":
+
+    # %% With picker + polarity
+    from obspy import UTCDateTime
+    from obspy.clients.fdsn import Client
+    import sys
+    sys.path.append("/home/niko/Earthquake-Seismogram-Denoiser/Code")
+    from Denoiser_EQShyb import Denoiser
+    import time
+    import seisbench.models as sbm
+    # from DenoisingFunctions import client_sed
+    picker = sbm.EQTransformer.from_pretrained("ethz")
+
+
+    # clients
+    # data_client     = client_sed
+    # metadata_client = client_sed
+    data_client = Client("ETH")      # or "IRIS", "GFZ", SDS client, etc.
+    metadata_client = Client("ETH")      # fdsn client for response
+
+    denoiser = Denoiser(
+        data_client     = data_client,
+        metadata_client = metadata_client,
+        model_path      = "/home/niko/Earthquake-Seismogram-Denoiser/Models/model_1000k_onlyweights.keras",
+        min_peak_height = 0.33,
+        eqs2_model_path = "/home/niko/Earthquake-Seismogram-Denoiser/Models/EQS2.keras",  # optional, omit for EQS only
+        picker=picker,  # optional, omit to skip picking
+        picking_kwargs={
+            "repeat": 20,  # should be < 100; 2 digits max.
+            "pick_tolerance": 1,
+            "p_confidence": 0.5,
+            "s_confidence": 0.5,
+            "min_share_models": 0.25,
+            "max_workers": 1 # leave at 1
+        },
+        # polarity_model_path="/home/niko/Schreibtisch/Polarity/Model/polarity_cnn_mixeddata_globalmaxavg_dropout02.keras",
+        polarity_model_path="/home/niko/Schreibtisch/EQ_denoising/NextGen/polarity_paper.keras", # SAME
+        polarity_kwargs={"threshold": 0.33, "mc_dropout": True},
+        debug=True
+    )
+
+    start_full = time.perf_counter()
+    denoiser.save_raw = True
+    # ── single window ─────────────────────────────────────────────────────────
+    denoiser.run_data(
+        network   = "CH",
+        station   = "MFERR",
+        location  = "*",
+        channel   = "HH",
+        starttime = UTCDateTime("2025-02-07T19:00:00"),
+        endtime   = UTCDateTime("2025-02-08T19:00:00")
+    )
+
+    elapsed_full = time.perf_counter() - start_full
+    print(elapsed_full)
