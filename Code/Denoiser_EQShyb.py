@@ -29,6 +29,7 @@ from obspy.core.event.base import WaveformStreamID, QuantityError
 from obspy.core.event.event import Event
 from obspy.core.event.header import EvaluationMode
 from scipy.fft import rfft as _rfft, irfft as _irfft, next_fast_len # NEW DIFF PREPROCESSING
+from fractions import Fraction   # NEW: exact fs_orig/fs_target ratio for FFT sizing
 #################NEW#######################################
 # tf.config.set_visible_devices([], 'GPU')  # turns GPU off
 _PROGRAM_START = time.perf_counter()
@@ -36,7 +37,6 @@ _PROGRAM_START = time.perf_counter()
 logger = logging.getLogger(__name__)
 logging.getLogger('asyncio').setLevel(logging.WARNING)
 SENTINEL = object()
-
 # ─── Module-level definitions ─────────────────────────────────────────────────
 #
 #  Functions (module-level):
@@ -608,11 +608,11 @@ class Denoiser(object):
         # but model was also trained this noise.
         # self.pre_filt = [1 / 100, 1 / 20, 45, 47.5]   # bandpass corners (Hz) for cosine taper pre-filter
 
-        print("CHECK PREFILT")
         self.stft_parameters = {"nperseg": 48, "nfft": 126, "fs": 100,"noverlap": 24}
         self.REALIGN_SCORE_TOLERANCE = 1#0.5#1 # 0.5 # NEW added
         self.signal_buffer_s = 3.0  # buffer to start save denoised stream with at least 3s before signal start (ideally)
         self.pad_seconds = 120.0  #  NEW ZEROPADDING FOR SEISCOMP
+        self.pad_seconds_post = 0.0
         self.one_sample_s = 1.0 / self.stft_parameters["fs"]  # = 0.01s at 100 Hz
 
         self.bin_spacing = (self.stft_parameters["nperseg"] - self.stft_parameters["noverlap"]) / self.stft_parameters["fs"]  # = 0.24
@@ -881,6 +881,47 @@ class Denoiser(object):
 
 
 
+    # def _process_segment(self, data_window): # ORIGINAL
+    #     """
+    #     data_window: numpy array of shape (len_sample, 3)
+    #                  Columns are Z, N, E components.
+    #     Returns:
+    #             (raw_stft, norm_stft) each shaped (64, 256, 6)
+    #     """
+    #
+    #     logger.debug("")
+    #     # Expecting shape (len_sample, 3)
+    #     if data_window.shape[0] != self.len_sample or \
+    #             data_window.shape[1] != 3:
+    #         logger.debug("returning None")
+    #         return None
+    #
+    #     stft_tmp = np.zeros((64, 256, 6), dtype=float)
+    #     stft_tmp_norm = np.zeros((64, 256, 6), dtype=float)
+    #
+    #     # Loop over 3 components: 0=Z, 1=N, 2=E
+    #     for j in range(3):
+    #         snippet_tmp = data_window[:, j]
+    #
+    #         # STFT for one component
+    #         _, _, _stft = scipy.signal.stft(snippet_tmp,
+    #                                         **self.stft_parameters)
+    #
+    #         # real/imag
+    #         stft_tmp[:, :, j*2] = _stft.real
+    #         stft_tmp[:, :, j*2 + 1] = _stft.imag
+    #
+    #         # Normalize (2 channels)
+    #         block = np.stack((_stft.real, _stft.imag), axis=2)
+    #         block_norm = normalize_percentile(block)
+    #
+    #         stft_tmp_norm[:, :, j*2] = block_norm[:, :, 0]
+    #         stft_tmp_norm[:, :, j*2 + 1] = block_norm[:, :, 1]
+    #
+    #     return stft_tmp, stft_tmp_norm # (64,256,6)
+    #
+
+
     def _process_segment(self, data_window):  # NEW COMBINED 3 COMP
         """
         data_window: numpy array of shape (len_sample, 3)
@@ -931,6 +972,61 @@ class Denoiser(object):
 
         return stft_tmp, stft_tmp_norm
 
+    # def _process_segment(self, data_window):
+    #     """
+    #     data_window: numpy array of shape (len_sample, 3)
+    #                  Columns are Z, N, E components.
+    #
+    #     Returns:
+    #         (raw_stft, norm_stft) each shaped (64, 256, 6)
+    #     """
+    #
+    #     logger.debug("")
+    #
+    #     # Expecting shape (len_sample, 3)
+    #     if data_window.shape[0] != self.len_sample or \
+    #             data_window.shape[1] != 3:
+    #         logger.debug("returning None")
+    #         return None
+    #
+    #     stft_tmp = np.zeros((64, 256, 6), dtype=float)
+    #     stft_tmp_norm = np.zeros((64, 256, 6), dtype=float)
+    #
+    #     stft_parameters = dict(self.stft_parameters)
+    #     stft_parameters["axis"] = -1
+    #
+    #     _, _, stft = scipy.signal.stft(
+    #         data_window.T,
+    #         **stft_parameters
+    #     )
+    #
+    #     stft_tmp[:, :, 0::2] = np.transpose(
+    #         stft.real,
+    #         (1, 2, 0)
+    #     )
+    #
+    #     stft_tmp[:, :, 1::2] = np.transpose(
+    #         stft.imag,
+    #         (1, 2, 0)
+    #     )
+    #
+    #     for j in range(3):
+    #         block = np.stack(
+    #             (
+    #                 stft[j].real,
+    #                 stft[j].imag
+    #             ),
+    #             axis=2
+    #         )
+    #
+    #         block_norm = normalize_percentile(block)
+    #
+    #         stft_tmp_norm[
+    #             :, :,
+    #             j * 2:j * 2 + 2
+    #         ] = block_norm
+    #
+    #     return stft_tmp, stft_tmp_norm
 
     def _compare_arrays_time_overlap(self, array1, array2, overlap=0.75):
         """
@@ -1097,12 +1193,18 @@ class Denoiser(object):
           5. rescale by nfft_new / nfft_orig, since the inverse FFT divides by
              its own length
 
-        Two things make this fast. The FFT length comes from next_fast_len(npts)
-        rather than _npts2nfft(npts): the doubling in the latter guards against
-        circular convolution, which cannot occur here because the spectrum is
-        only multiplied point-wise. And the response is evaluated at 32768
-        frequencies (freq_resolution <0.01 Hz for 250sps data)
-        and interpolated onto the FFT grid rather than evaluated per bin.
+        Two things make this fast. The transform lengths come from one shared
+        integer: with fs_orig/fs_target = p/q in lowest terms and
+        k = next_fast_len(ceil(npts_orig/p)), nfft_orig = p*k and nfft_new = q*k.
+        Tying them together is required for correctness, not just speed — bin k
+        means k*fs/nfft, so if nfft_new were chosen independently the output time
+        base would be stretched. Choosing nfft_orig near npts rather than 2*npts
+        halves the FFT cost; the spectral multiplication is a circular
+        convolution, so this relies on the long cosine taper and the trimmed
+        buffer absorbing the wrapped tail (verified: identical to the 2x-padded
+        result at the 5e-06 level). And the response is evaluated at 32768
+        frequencies and interpolated onto the FFT grid rather than evaluated per
+        bin.
 
         data      : obspy.Stream, 3 traces of equal length and sample rate.
                     Modified in place: data, sampling_rate and npts are all
@@ -1118,15 +1220,29 @@ class Denoiser(object):
         npts_orig = len(data[0].data)
         npts_new = int(round(npts_orig * fs_target / fs_orig))
 
+        # Catching failues
+        if len({tr.stats.npts for tr in data}) != 1:  # check if all traces same length
+            raise ValueError(
+                f"unequal trace lengths {[tr.stats.npts for tr in data]} "
+                f"for {data[0].id[:-1]} — traces must be padded to a common window")
+        if fs_orig < fs_target:
+            raise ValueError(
+                f"sampling rate {fs_orig} Hz below target {fs_target} Hz "
+                f"for {data[0].id[:-1]}")
+        if self.pre_filt[3] > fs_target / 2:
+            raise ValueError(
+                f"pre_filt upper corner {self.pre_filt[3]} Hz exceeds the target "
+                f"Nyquist {fs_target/2} Hz — the Nyquist bin would be complex")
+
         # CHECK saver way to compute nfft_orig, nfft_new
-        # _ratio = Fraction(fs_orig / fs_target).limit_denominator(1000)
-        # _p, _q = _ratio.numerator, _ratio.denominator
-        # _k = next_fast_len(int(np.ceil(npts_orig / _p)))
-        # nfft_orig, nfft_new = _p * _k, _q * _k
+        _ratio = Fraction(fs_orig / fs_target).limit_denominator(1000)
+        _p, _q = _ratio.numerator, _ratio.denominator
+        _k = next_fast_len(int(np.ceil(npts_orig / _p)))
+        nfft_orig, nfft_new = _p * _k, _q * _k
 
 
         # next_fast_len >= npts is enough with long buffer + cosine taper
-        nfft_orig = next_fast_len(npts_orig)
+        # nfft_orig = next_fast_len(npts_orig)
         freqs = np.fft.rfftfreq(nfft_orig, d=1.0 / fs_orig)
 
         # ── frequency-domain taper (anti-alias + bandpass) ────────────
@@ -1158,7 +1274,7 @@ class Denoiser(object):
                              sactaper=True, halfcosine=False)
 
         # ── spectral decimation sizes ─────────────────────────────────
-        nfft_new = next_fast_len(npts_new)
+        # nfft_new = next_fast_len(npts_new)
 
         # print("==============TEST===============")
         # print(nfft_new == nfft_orig * fs_target / fs_orig)
@@ -1237,15 +1353,49 @@ class Denoiser(object):
         data.merge(fill_value=0, method=1)
 
         if len(data) != 3:
-            logger.debug("Couldn't receive all data for "
-                         "{network}.{station}.{location}.{channel}"
-                         "{starttime} {endtime}")
+            logger.warning(
+                f"Expected 3 traces, got {len(data)} "
+                f"({', '.join(sorted(tr.id for tr in data))}) for "
+                f"{network}.{station}.{location}.{channel} "
+                f"{starttime} – {endtime}")
             return None
+
+        # NEW CHECK
+        want_start, want_end = starttime - buffer, endtime + buffer
+        covered_start = max(tr.stats.starttime for tr in data)
+        covered_end = min(tr.stats.endtime for tr in data)
+        npts_before = [tr.stats.npts for tr in data]
+
+        if covered_start > want_start:
+            gap_intervals.append((want_start, covered_start))
+            logger.warning(f"{data[0].id[:-1]}: missing "
+                           f"{covered_start - want_start:.1f}s at the start, zero-padded")
+        if covered_end < want_end:
+            gap_intervals.append((covered_end, want_end))
+            logger.warning(f"{data[0].id[:-1]}: missing "
+                           f"{want_end - covered_end:.1f}s at the end, zero-padded")
+
+        data.trim(want_start, want_end, pad=True, fill_value=0, nearest_sample=True)
+
+        if len(set(npts_before)) != 1:
+            logger.warning(f"{data[0].id[:-1]}: components had unequal lengths "
+                           f"{npts_before}, padded to {data[0].stats.npts}")
+        # END NEW
 
         metadata = self._get_metadata(network, station, location,
                                       f"{channel}?", starttime, starttime)
 
-
+        ################### QUICK TEST ----------------------------------------------------------
+        # apply filter as in obspy remove_response prefilter & remove any other AA filter
+        # data = apply_pre_filt_stream(data, self.pre_filt,taper_seconds=self.buffer)
+        #
+        # if data[0].stats.sampling_rate % 100 == 0:
+        #     data.decimate(factor=int(data[0].stats.sampling_rate // 100),no_filter=True)
+        # else:
+        #     # data.filter("lowpass", freq=45.0, corners=8, zerophase=False)  # NEW - add filter ???
+        #     data.resample(100,no_filter=True) # no filter default, additioonal AA off by frequency taper
+        #
+        # self._fast_remove_response(data, metadata)
 
         self._preprocess_combined(data, metadata)
         ################### END QUICK TEST ----------------------------------------------------------
@@ -1954,17 +2104,113 @@ class Denoiser(object):
                                      f"(samples {i_start}:{i_end})")
 
 
-        # ── START NEW PART prepend zero-padding to each trace ───────────────────────────
-        if self.pad_seconds > 0:
+        pad_pre = self.pad_seconds
+        pad_post = self.pad_seconds_post
+        # ── START NEW PART prepend zero-padding start of each trace ───────────────────────────
+        if pad_pre > 0 and pad_post == 0.0:
             output_stream.sort(keys=['channel', 'starttime'])
             prev_end = {}
             for tr in output_stream:
-                pad_start = tr.stats.starttime - self.pad_seconds
+                pad_start = tr.stats.starttime - pad_pre
                 if tr.id in prev_end:
                     pad_start = max(pad_start,
                                     prev_end[tr.id] + self.one_sample_s)
                 prev_end[tr.id] = tr.stats.endtime
                 tr.trim(starttime=pad_start, pad=True, fill_value=0)
+        # ── END OF NEW PART ───────────────────────────
+        # ── START NEW PART prepend zero-padding start and end of each trace ───────────────────────────
+        if pad_pre > 0 and pad_post > 0:
+            output_stream.sort(keys=['channel', 'starttime'])
+            sid = output_stream[0].id[:-1]
+
+            order = sorted(range(len(output_stream)),
+                           key=lambda j: output_stream[j].stats.starttime)
+            group_of = [0] * len(output_stream)
+            windows = []
+            ragged = False
+            for j in order:
+                tr = output_stream[j]
+                if windows and tr.stats.starttime <= windows[-1][1]:
+                    w = windows[-1]
+                    if tr.stats.starttime != w[0] or tr.stats.endtime != w[1]:
+                        ragged = True
+                    windows[-1] = (w[0], max(w[1], tr.stats.endtime))
+                else:
+                    windows.append((tr.stats.starttime, tr.stats.endtime))
+                group_of[j] = len(windows) - 1
+
+            if ragged or len(output_stream) != 3 * len(windows):
+                logger.warning(
+                    f"{sid}: {len(output_stream)} traces in {len(windows)} "
+                    f"detection windows"
+                    f"{' with unequal component extents' if ragged else ''} — "
+                    f"padding each detection to one common window")
+
+            limits = []
+            diag = []
+            for i, (w_start, w_end) in enumerate(windows):
+                new_start = w_start - pad_pre
+                new_end = w_end + pad_post
+                reason_pre = "full" if pad_pre > 0 else "not requested"
+                reason_post = "full" if pad_post > 0 else "not requested"
+
+                if i > 0:
+                    avail = (w_start - windows[i - 1][1]) - self.one_sample_s
+                    if avail <= 0:
+                        new_start = w_start
+                        if pad_pre > 0:
+                            reason_pre = f"blocked, {max(avail, 0.0):.2f}s free"
+                    elif pad_pre + pad_post > avail:
+                        share = avail * (pad_post / (pad_pre + pad_post))
+                        clamped = w_start - (avail - share)
+                        if clamped > new_start:
+                            new_start = clamped
+                            reason_pre = (f"clamped, {avail + self.one_sample_s:.2f}s "
+                                          f"gap shared with prev")
+
+                if i < len(windows) - 1:
+                    avail = (windows[i + 1][0] - w_end) - self.one_sample_s
+                    if avail <= 0:
+                        new_end = w_end
+                        if pad_post > 0:
+                            reason_post = f"blocked, {max(avail, 0.0):.2f}s free"
+                    elif pad_pre + pad_post > avail:
+                        share = avail * (pad_post / (pad_pre + pad_post))
+                        clamped = w_end + share
+                        if clamped < new_end:
+                            new_end = clamped
+                            reason_post = (f"clamped, {avail + self.one_sample_s:.2f}s "
+                                           f"gap shared with next")
+
+                ns, ne = min(new_start, w_start), max(new_end, w_end)
+                limits.append((ns, ne))
+                diag.append((w_start - ns, ne - w_end,
+                             reason_pre, reason_post, w_end - w_start))
+
+            for i, (got_pre, got_post, r_pre, r_post, span) in enumerate(diag):
+                logger.debug(
+                    f"{sid} pad [{i+1}/{len(diag)}] {windows[i][0]}  "
+                    f"pre {got_pre:6.2f}/{pad_pre:.1f}s ({r_pre})  "
+                    f"post {got_post:6.2f}/{pad_post:.1f}s ({r_post})  "
+                    f"{span + self.one_sample_s:.2f}s -> "
+                    f"{span + self.one_sample_s + got_pre + got_post:.2f}s")
+
+            n_full = sum(1 for d in diag
+                         if d[2] in ("full", "not requested")
+                         and d[3] in ("full", "not requested"))
+            logger.info(
+                f"{sid}: zero-padded {len(diag)} detections, {n_full} with the "
+                f"full {pad_pre:.0f}/{pad_post:.0f}s, {len(diag) - n_full} "
+                f"clamped by neighbours; mean pre "
+                f"{sum(d[0] for d in diag)/len(diag):.1f}s, mean post "
+                f"{sum(d[1] for d in diag)/len(diag):.1f}s")
+
+            for j, tr in enumerate(output_stream):
+                new_start, new_end = limits[group_of[j]]
+                if new_start == tr.stats.starttime and new_end == tr.stats.endtime:
+                    continue
+                tr.trim(starttime=new_start, endtime=new_end,
+                        pad=True, fill_value=0, nearest_sample=False)
         # ── END OF NEW PART ───────────────────────────
 
         dir_tmp = str(Path(self.model_name).parent /
@@ -2480,6 +2726,85 @@ class Denoiser(object):
         return {'p_picks': p_picks, 's_picks': s_picks}
 
 
+    #
+    # def _process_picks(self, st_denoised, st_designaled,  # ORIGINAL
+    #                    repeat=20, pick_tolerance=1,
+    #                    p_confidence=0.5, s_confidence=0.5,
+    #                    min_share_models=0.25,
+    #                    max_workers=None):
+    #     """
+    #     Parallel TTA picking loop over all detected event snippets.
+    #     Processes each Z/N/E triple independently via ThreadPoolExecutor.
+    #     Results are collected via as_completed(); pick order in the output
+    #     lists is non-deterministic but irrelevant since each Pick carries
+    #     an absolute UTC time and event_id.
+    #
+    #     st_denoised      : obspy.Stream, denoised snippets (Z/N/E triples)
+    #     st_designaled    : obspy.Stream, per-snippet designaled noise for TTA
+    #                        amplitude scaling, aligned to st_denoised
+    #                        (same number of Z/N/E triples)
+    #     repeat           : int, number of TTA augmentations per snippet
+    #     pick_tolerance   : float, pick clustering tolerance (s)
+    #     p_confidence     : float, min picker confidence to accept a P pick
+    #     s_confidence     : float, min picker confidence to accept an S pick
+    #     min_share_models : float, min fraction of TTA repetitions that must
+    #                        exceed the confidence threshold for a pick to be kept
+    #     Returns          : dict with keys 'p_picks' and 's_picks', each a list
+    #                        of Pick objects with share > min_share_models
+    #     """
+    #     all_results = {'p_picks': [], 's_picks': []}
+    #
+    #     # sort both streams by starttime so Z/N/E triples zip correctly
+    #     # st_denoised.sort(keys=['starttime'])
+    #     # st_designaled.sort(keys=['starttime'])
+    #     st_denoised = obspy.core.Stream(
+    #         sorted(st_denoised.traces, key=lambda tr: tr.stats.starttime))
+    #     st_designaled = obspy.core.Stream(
+    #         sorted(st_designaled.traces, key=lambda tr: tr.stats.starttime))
+    #
+    #     # explicit component selection + sort ensures deterministic pairing
+    #     st_z_list = sorted(st_denoised.select(component=self.components[0]),
+    #                        key=lambda tr: tr.stats.starttime)
+    #     st_1_list = sorted(st_denoised.select(component=self.components[1]),
+    #                        key=lambda tr: tr.stats.starttime)
+    #     st_2_list = sorted(st_denoised.select(component=self.components[2]),
+    #                        key=lambda tr: tr.stats.starttime)
+    #
+    #     event_streams_list = list(zip(st_z_list, st_1_list, st_2_list))
+    #     designaled_streams_list = [st_designaled[3 * i: 3 * (i + 1)]
+    #                                for i in range(len(event_streams_list))]
+    #
+    #     # assert len(event_streams_list) == len(designaled_streams_list), (
+    #     #     f"Mismatch: {len(event_streams_list)} event streams vs "
+    #     #     f"{len(designaled_streams_list)} designaled streams"
+    #     # )
+    #     assert len(st_designaled) == 3 * len(event_streams_list), (
+    #         f"Mismatch: {len(event_streams_list)} event triples vs "
+    #         f"{len(st_designaled) / 3:.1f} designaled triples")
+    #
+    #     workers = max_workers or self.pick_workers
+    #     jobs = list(zip(event_streams_list, designaled_streams_list))   # ◀ define once, use both branches
+    #     if workers == 1:
+    #         results = [self._process_snippet(event_streams, designaled_stream,
+    #                                           repeat, pick_tolerance, p_confidence, s_confidence)
+    #                    for event_streams, designaled_stream in jobs]
+    #     else:
+    #         print("Using more than 1 worker - check picking reproducibility")
+    #         with ThreadPoolExecutor(max_workers=workers) as executor:
+    #             futures = [executor.submit(self._process_snippet, event_streams, designaled_stream,
+    #                                        repeat, pick_tolerance, p_confidence, s_confidence)
+    #                        for event_streams, designaled_stream in jobs]
+    #             results = [f.result() for f in futures]
+    #
+    #     for result in results:
+    #         all_results['p_picks'].extend(result['p_picks'])
+    #         all_results['s_picks'].extend(result['s_picks'])
+    #
+    #     all_results['p_picks'] = [p for p in all_results['p_picks'] if p.share > min_share_models]   # ◀ restored
+    #     all_results['s_picks'] = [p for p in all_results['s_picks'] if p.share > min_share_models]   # ◀ restored
+    #
+    #     return all_results
+
 
     def _process_picks(self, snippet_jobs,  # NEW
                            repeat=20, pick_tolerance=1,
@@ -2612,6 +2937,104 @@ class Denoiser(object):
         return picks
 
 
+    # def _pick(self, trimmed_streams, data_original):  # ORIGINAL
+    #     """
+    #     Run phase picking on denoised event snippets using TTA.
+    #     Computes per-snippet designaled noise (original - denoised) to provide
+    #     the amplitude info for TTA white noise scaling. Memory cost scales
+    #     with number of detections x snippet length.
+    #
+    #     trimmed_streams : obspy.Stream
+    #         Denoised event snippets from _trim_streams(), Z/N/E per detection.
+    #         Picker runs on these only — never on continuous data.
+    #     data_original   : obspy.Stream
+    #         Original restituted full-day stream from _get_data().
+    #         Only in memory (not saved to disk). Used only to compute
+    #         per-snippet noise via (original - denoised).
+    #
+    #     Returns dict with keys 'p_picks' and 's_picks', each a list of Pick
+    #             objects (time, uncertainty, share, event_id, polarity).
+    #     """
+    #     # logger.debug(f"_pick: data_original has {len(data_original)} traces: "
+    #     #              f"{[tr.stats.channel for tr in data_original]}")
+    #
+    #     if not len(trimmed_streams):
+    #         logger.info("No denoised snippets — skipping picking")
+    #         return {'p_picks': [], 's_picks': []}
+    #
+    #     data_start = data_original[0].stats.starttime
+    #     data_end = data_original[0].stats.endtime
+    #
+    #     num_detections = len(trimmed_streams) // 3
+    #     st_designaled_snippets = obspy.core.Stream()
+    #
+    #     for i in range(num_detections):
+    #         snippet = trimmed_streams[3 * i: 3 * (i + 1)]
+    #         # logger.debug(f"Detection {i}: snippet components = "
+    #         #              f"{[tr.stats.channel for tr in snippet]}, "
+    #         #              f"npts = {[tr.stats.npts for tr in snippet]}")
+    #
+    #         tr_ref = snippet.select(component=self.components[0])[0]
+    #
+    #         # if tr_ref.stats.npts == 0:  # TODO check why this happens
+    #         #     logger.warning(f"Detection {i}: zero-length snippet — skipping")
+    #         #     continue
+    #         if tr_ref.stats.npts == 0:
+    #             logger.warning(f"Detection {i}: zero-length snippet — using zero noise")
+    #             for tr in snippet:
+    #                 zero_tr = tr.copy()
+    #                 zero_tr.data = np.zeros_like(tr.data)
+    #                 st_designaled_snippets += zero_tr
+    #             continue
+    #
+    #         # start = tr_ref.stats.starttime
+    #         # end = tr_ref.stats.endtime
+    #         start = max(tr_ref.stats.starttime, data_start)  # clamp
+    #         end = min(tr_ref.stats.endtime, data_end)  # clam
+    #         npts = tr_ref.stats.npts
+    #
+    #         # slice original to same window — tr.slice() avoids copying full day
+    #         original_snippet = obspy.core.Stream()
+    #
+    #         for tr in data_original:
+    #             tr_sliced = tr.slice(start, end)
+    #             # logger.debug(f"_pick slice: tr={tr.id} "
+    #             #              f"data={tr.stats.starttime}—{tr.stats.endtime} "
+    #             #              f"slice={start}—{end} "
+    #             #              f"result_npts={tr_sliced.stats.npts} "
+    #             #              f"expected_npts={npts}")
+    #
+    #             if tr_sliced.stats.npts != npts:
+    #                 tr_sliced = tr_sliced.trim(
+    #                     start,
+    #                     start + (npts - 1) * tr_sliced.stats.delta,
+    #                     nearest_sample=True, pad=True, fill_value=0
+    #                 )
+    #             original_snippet += tr_sliced
+    #
+    #         # logger.warning(f"snippet:{snippet[0].stats.starttime} — {snippet[0].stats.endtime}")
+    #         # logger.warning(f"original_snippet: {original_snippet[0].stats.starttime} — {original_snippet[0].stats.endtime}")
+    #
+    #         noise_snippet = self._get_designaled_noise(snippet, original_snippet)
+    #         if len(noise_snippet) == 0:
+    #             logger.warning(f"Detection {i}: _get_designaled_noise failed — "
+    #                            f"using zero noise for this snippet")
+    #             # zero-fill to preserve index alignment with trimmed_streams
+    #             for tr in snippet:
+    #                 zero_tr = tr.copy()
+    #                 zero_tr.data = np.zeros_like(tr.data)
+    #                 st_designaled_snippets += zero_tr
+    #         else:
+    #             st_designaled_snippets += noise_snippet
+    #
+    #     picks = self._process_picks(
+    #         st_denoised=trimmed_streams,
+    #         st_designaled=st_designaled_snippets,
+    #         **self.picking_kwargs
+    #     )
+    #     logger.info(f"Picks: {len(picks['p_picks'])} P, "
+    #                 f"{len(picks['s_picks'])} S")
+    #     return picks
 
     def _save_picks(self, picks, starttime, stream_id=None):
         """
@@ -3045,7 +3468,8 @@ class Denoiser(object):
         #      snippets that end up exactly contiguous, so the number of traces
         #      in the file is not necessarily the number of detections.
         self._output(data[0].stats.starttime, streams_to_save, gap_intervals)
-# %%
+        return True  # check for complete run
+
 # %%
 if __name__ == "__main__":
 
@@ -3089,7 +3513,7 @@ if __name__ == "__main__":
     )
 
     start_full = time.perf_counter()
-    denoiser.save_raw = True
+    denoiser.save_raw = False
     # ── single window ─────────────────────────────────────────────────────────
     denoiser.run_data(
         network   = "CH",
