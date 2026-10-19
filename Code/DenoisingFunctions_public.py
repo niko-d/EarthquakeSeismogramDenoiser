@@ -566,12 +566,13 @@ def wv2stft(stream):
       """
     stft_parameters = {"nperseg": 48, "nfft": 126, "fs": 100, "noverlap": 24}
 
-    components = []
-    for trace in stream:
-        components.append(trace.stats.channel[2])
-    components.sort(reverse=True)
-    stream.sort(reverse=True)
+    priority = {'Z': 0, 'N': 1, 'E': 2, '1': 1, '2': 2, '3': 3}
+    stream = Stream(sorted(
+        stream,
+        key=lambda tr: priority[tr.stats.channel[-1]]
+    ))
 
+    components = [tr.stats.channel[-1] for tr in stream]
     # get waveform data
     data_z = stream.select(component=components[0])[0].data[:6120]
     data_n = stream.select(component=components[1])[0].data[:6120]
