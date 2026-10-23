@@ -95,7 +95,7 @@ def result_processor(queue):
         while True:
             content = queue.get()
             print("Dequeued: ", content)
-            if content is SENTINEL:
+            if content == SENTINEL:
                 return
             f.write(str(content))
         

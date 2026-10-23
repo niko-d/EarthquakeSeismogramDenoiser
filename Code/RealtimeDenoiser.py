@@ -28,7 +28,7 @@ def start_consumer(queue, *args, **kwargs):
     while True:
         content = queue.get()
         print("Dequeued content: ", content)
-        if content is SENTINEL:
+        if content == SENTINEL:
             return
         r.run_realtime(content)
         

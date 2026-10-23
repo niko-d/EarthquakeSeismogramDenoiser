@@ -88,12 +88,13 @@ def _predict_polarity_tta(
 class Picker(object):
     
     def __init__(self, logger, picker, model_name, stft_parameters, picking_kwargs=None,
-                 polarity_model_path=None, polarity_kwargs=None, pick_output="json" ):
+                 polarity_model_path=None, polarity_kwargs=None, pick_output="json", lock = None):
         logger = logger
         logger.debug("")
         print("Picker started")
         # PICKER
         self.picker = picker
+        self.lock = lock
         print("Picker set to: ", picker)
         self.picking_kwargs = picking_kwargs or {}
         self.uncertainty_scaling = {
@@ -514,8 +515,8 @@ class Picker(object):
                 s_confidence,
             )
  
-        all_results['p_picks'].extend(result['p_picks'])
-        all_results['s_picks'].extend(result['s_picks'])
+            all_results['p_picks'].extend(result['p_picks'])
+            all_results['s_picks'].extend(result['s_picks'])
 
         # filter by minimum share of TTA models above confidence threshold
         all_results['p_picks'] = [e for e in all_results['p_picks']
@@ -644,6 +645,8 @@ class Picker(object):
                     available pick's event_id by stripping the trailing component
                     character (event_id[:-1]).
         """
+        logger.debug("")
+        logger.debug(picks)
         dir_tmp = "/tmp/"
         check_dir(dir_tmp)
 
@@ -669,7 +672,17 @@ class Picker(object):
                         print("XXXX======> Cannot unpack: ")
                         print(pick)
                         continue
+                    if self.lock:
+                        with self.lock:
+                            with open("results.csv", "a", newline="") as f:
+                                f.write(f"{_time}, {id}, {phase}, {polarity}\n")
                     print('====>', _time, id, phase, polarity)
+        
+        
+        if self.lock:
+            with self.lock:
+                with open("picks.raw", "a", newline="") as f:
+                    f.write(f"{picks}\n")
         
         return
         if self.pick_output in ("json", "both"):
