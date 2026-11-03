@@ -104,3 +104,26 @@ Optional arguments:
 ![Phase Picking with Test Time Augmentation](Images/TTA_figure_paper_simple2.png)
 ***Phase Picking with Test Time Augmentation.** Dahmen et al., BSSA*
 
+
+---
+
+<table>
+<tr>
+<td width="70%" valign="middle">
+
+### TRANSFORM² Project
+
+This work is part of the **TRANSFORM² project**, which aims to improve physical and digital infrastructure across Near-Fault Observatories (NFOs) in Europe.
+
+TRANSFORM² is funded by the **European Union** under project number **101188365**, within the **HORIZON-INFRA-2024-DEV-01-01** call.
+
+</td>
+<td width="30%" align="center" valign="middle">
+
+<img src="Images/Logo_TRANSFORM2.png" alt="TRANSFORM² Project Logo" width="180">
+
+</td>
+</tr>
+</table>
+
+---
