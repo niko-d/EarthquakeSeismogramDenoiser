@@ -117,8 +117,8 @@ After writing the files, the script plots the denoised and the preprocessed stre
 
 [Picking_public.py](Code/Picking_public.py) picks P and S phases with EQTransformer (SeisBench, `ethz` weights) on the denoised data. Timing uncertainty is estimated by picking on several noise-augmented waveforms and scaling the variation of the picks to an uncertainty; the median pick is reported.
 
-Requires Code/requirements_with_picking.txt and the output of step 2 run with --saveraw True. Set the input paths and start at the top of the script to the step-2 output folder and start time, then run python Picking_public.py.
-
+   Requires `Code/requirements_with_picking.txt` and the output of step 2 run with `--saveraw True`. Set the input paths and `start` at the top of the script to the step-2 output folder and start time, then run `python Picking_public.py`.
+   
 Main settings of `process_stream`:
 
 | Parameter | Default | Description |
